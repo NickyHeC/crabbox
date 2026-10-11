@@ -1,4 +1,4 @@
-name: Coordinator capacity settings
+name: Coordinator capacity binding shape
 
 # Operations branch only: do not merge this replacement of the deploy workflow.
 on:
@@ -17,27 +17,24 @@ jobs:
     timeout-minutes: 10
     environment: coordinator
     steps:
-      - name: Apply the reviewed owner capacity setting
+      - name: Read the reviewed capacity binding shapes
         shell: bash
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           python3 -I -B - <<'PY'
           import copy
-          import hashlib
           import json
           import os
           import re
           import sys
           import urllib.error
           import urllib.request
-          import uuid
 
           ACCOUNT = "91b59577e757131d68d55a471fe32aca"
           WORKER = "crabbox-coordinator"
           BASE = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/workers/scripts/{WORKER}"
           BRANCH = "refs/heads/ops/capacity-settings-20261011"
-          OWNER = "github:25068"
           OWNERS = "CRABBOX_CAPACITY_ADMIN_OWNERS"
           LIMIT = "CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN"
           MAX_RESPONSE = 2 * 1024 * 1024
@@ -69,21 +66,12 @@ jobs:
                   self.token = token
                   self.opener = urllib.request.build_opener(NoRedirect())
 
-              def request(self, method, path, settings=None):
-                  require((method == "PATCH" and path == "/settings" and settings is not None)
-                          or (method == "GET" and settings is None and
-                              (path in ("/settings", "/versions?per_page=1", "/deployments")
-                               or re.fullmatch(r"/versions/[0-9a-f-]{36}", path))), "request_scope")
+              def request(self, method, path):
+                  require(method == "GET" and
+                          (path in ("/settings", "/versions?per_page=1", "/deployments")
+                           or re.fullmatch(r"/versions/[0-9a-f-]{36}", path)), "request_scope")
                   headers = {"Authorization": "Bearer " + self.token, "Accept": "application/json"}
-                  body = None
-                  if settings is not None:
-                      boundary = "capacity-" + uuid.uuid4().hex
-                      raw = json.dumps(settings, separators=(",", ":"), allow_nan=False).encode()
-                      body = (f'--{boundary}\r\nContent-Disposition: form-data; name="settings"\r\n'
-                              'Content-Type: application/json\r\n\r\n').encode() + raw
-                      body += f"\r\n--{boundary}--\r\n".encode()
-                      headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
-                  request = urllib.request.Request(BASE + path, data=body, headers=headers, method=method)
+                  request = urllib.request.Request(BASE + path, headers=headers, method=method)
                   try:
                       with self.opener.open(request, timeout=30) as response:
                           require(response.status == 200, "http_status")
@@ -159,34 +147,23 @@ jobs:
               return {"settings": settings, "version": latest, "deployment": deployment,
                       "code": code, "runtime": resources["script_runtime"]}
 
-          def proposal(settings):
-              bindings = binding_map(settings)
-              values = {}
-              for key in (OWNERS, LIMIT):
-                  row = bindings.get(key)
-                  require(row is None or (set(row) == {"name", "type", "text"}
-                          and row["type"] == "plain_text" and isinstance(row["text"], str)),
-                          "capacity_binding_type")
-                  values[key] = row["text"] if row else None
-              owners = values[OWNERS] or ""
-              if OWNER not in {part.strip().lower() for part in owners.split(",")}:
-                  owners += ("," if owners else "") + OWNER
-              cap = values[LIMIT]
-              require(cap is not None, "capacity_limit_missing")
-              require(re.fullmatch(r"[0-9]{1,16}", cap) and
-                      0 < int(cap) <= 9007199254740991, "capacity_limit_invalid")
-              cap = cap if int(cap) >= 20 else "20"
-              replacements = {key: {"name": key, "type": "plain_text", "text": value}
-                              for key, value in ((OWNERS, owners), (LIMIT, cap))}
-              desired = copy.deepcopy(settings)
-              desired["bindings"] = [copy.deepcopy(row) for name, row in bindings.items()
-                                     if name not in replacements] + list(replacements.values())
-              # /settings inheritance uses latest, so snapshot() refuses an undeployed
-              # latest version. No secret or resource value is reconstructed or sent.
-              patch = {"bindings": [{"name": name, "type": "inherit"} for name in bindings
-                                    if name not in replacements] + list(replacements.values()),
-                       "annotations": writable_annotations(settings)}
-              return desired, patch, int(cap)
+          def binding_shape(row):
+              if row is None:
+                  return {"present": False}
+              known_types = {"plain_text", "secret_text", "json", "inherit"}
+              known_fields = {"name", "type", "text", "json", "old_name", "version_id"}
+              text = row.get("text")
+              if "text" not in row:
+                  text_type = "absent"
+              elif text is None:
+                  text_type = "null"
+              else:
+                  text_type = {str: "string", bool: "boolean", int: "number", float: "number",
+                               list: "array", dict: "object"}.get(type(text), "other")
+              return {"present": True, "type": row["type"] if row["type"] in known_types else "other",
+                      "fields": sorted(set(row) & known_fields), "unknown_field_count": len(set(row) - known_fields),
+                      "text_present": "text" in row, "text_type": text_type,
+                      "text_empty": isinstance(text, str) and text == ""}
 
           def context():
               require(os.environ.get("GITHUB_REPOSITORY") == "openclaw/crabbox"
@@ -202,46 +179,17 @@ jobs:
               return token
 
           def main():
-              attempted = False
-              confirmed = False
-              expected_hash = None
               try:
                   api = Cloudflare(context())
-                  before = snapshot(api)
-                  desired, patch, cap = proposal(before["settings"])
-                  # Read the same live identity and full settings immediately before
-                  # writing. The workflow concurrency group serializes repo deploys;
-                  # Cloudflare does not provide a conditional settings PATCH here.
-                  require(snapshot(api) == before, "prewrite_changed")
-                  if comparable_settings(desired) == comparable_settings(before["settings"]):
-                      print(json.dumps({"status": "already_present", "patch_attempts": 0,
-                                        "owner": OWNER, "capacity_admin_limit": cap}))
-                      return 0
-                  expected_hash = hashlib.sha256(json.dumps(comparable_settings(desired), sort_keys=True,
-                      separators=(",", ":"), allow_nan=False).encode()).hexdigest()
-                  attempted = True
-                  try:
-                      api.request("PATCH", "/settings", patch)
-                      confirmed = True
-                  except Refusal:
-                      pass  # Ambiguous response: observe only. Never retry the PATCH.
-                  after = snapshot(api)
-                  require(comparable_settings(after["settings"]) == comparable_settings(desired),
-                          "postwrite_settings_mismatch")
-                  require(after["code"] == before["code"] and after["runtime"] == before["runtime"],
-                          "postwrite_code_mismatch")
-                  print(json.dumps({"status": "applied_readback_verified", "patch_attempts": 1,
-                                    "patch_response_confirmed": confirmed, "owner": OWNER,
-                                    "capacity_admin_limit": cap, "code_unchanged": True,
-                                    "expected_settings_sha256": expected_hash,
-                                    "before_version": before["version"], "after_version": after["version"]}))
+                  bindings = binding_map(snapshot(api)["settings"])
+                  print(json.dumps({"status": "binding_shapes_observed", "read_only": True,
+                                    "patch_attempts": 0,
+                                    "bindings": {name: binding_shape(bindings.get(name)) for name in (OWNERS, LIMIT)}}))
                   return 0
               except Exception as exc:
-                  print(json.dumps({"status": "requires_reconciliation" if attempted else "refused",
+                  print(json.dumps({"status": "refused", "read_only": True,
                                     "reason": str(exc) if isinstance(exc, Refusal) else "unexpected_shape",
-                                    "patch_attempts": int(attempted),
-                                    "patch_response_confirmed": confirmed,
-                                    **({"expected_settings_sha256": expected_hash} if attempted else {})}))
+                                    "patch_attempts": 0}))
                   return 1
 
           if __name__ == "__main__":
