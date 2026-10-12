@@ -1,4 +1,4 @@
-name: Coordinator temporary owner capacity
+name: Coordinator bounded passive diagnostic
 
 # Operations branch only: do not merge this replacement of the deploy workflow.
 on:
@@ -12,234 +12,212 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  capacity:
+  diagnostic:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     environment: coordinator
     steps:
-      - name: Apply the reviewed owner capacity setting
+      - name: Observe existing worker traffic with a temporary Tail
         shell: bash
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NODE_NO_WARNINGS: "1"
         run: |
-          python3 -I -B - <<'PY'
-          import copy
-          import hashlib
-          import json
-          import os
-          import re
-          import sys
-          import urllib.error
-          import urllib.request
-          import uuid
-
-          ACCOUNT = "91b59577e757131d68d55a471fe32aca"
-          WORKER = "crabbox-coordinator"
-          BASE = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/workers/scripts/{WORKER}"
-          BRANCH = "refs/heads/ops/capacity-settings-20261011"
-          TARGET = "CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER"
-          GUARD_LIMITS = ("CRABBOX_MAX_ACTIVE_LEASES", "CRABBOX_MAX_ACTIVE_LEASES_PER_ORG",
-                          "CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN")
-          MAX_RESPONSE = 2 * 1024 * 1024
-
-          class Refusal(Exception):
-              pass
-
-          def require(condition, code):
-              if not condition:
-                  raise Refusal(code)
-
-          def unique_object(pairs):
-              result = {}
-              for key, value in pairs:
-                  require(key not in result, "duplicate_json_key")
-                  result[key] = value
-              return result
-
-          def decode(raw):
-              return json.loads(raw, object_pairs_hook=unique_object,
-                                parse_constant=lambda _: require(False, "nonfinite_json"))
-
-          class NoRedirect(urllib.request.HTTPRedirectHandler):
-              def redirect_request(self, req, fp, code, msg, headers, newurl):
-                  return None
-
-          class Cloudflare:
-              def __init__(self, token):
-                  self.token = token
-                  self.opener = urllib.request.build_opener(NoRedirect())
-
-              def request(self, method, path, settings=None):
-                  require((method == "PATCH" and path == "/settings" and settings is not None)
-                          or (method == "GET" and settings is None and
-                              (path in ("/settings", "/versions?per_page=1", "/deployments")
-                               or re.fullmatch(r"/versions/[0-9a-f-]{36}", path))), "request_scope")
-                  headers = {"Authorization": "Bearer " + self.token, "Accept": "application/json"}
-                  body = None
-                  if settings is not None:
-                      boundary = "capacity-" + uuid.uuid4().hex
-                      raw = json.dumps(settings, separators=(",", ":"), allow_nan=False).encode()
-                      body = (f'--{boundary}\r\nContent-Disposition: form-data; name="settings"\r\n'
-                              'Content-Type: application/json\r\n\r\n').encode() + raw
-                      body += f"\r\n--{boundary}--\r\n".encode()
-                      headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
-                  request = urllib.request.Request(BASE + path, data=body, headers=headers, method=method)
-                  try:
-                      with self.opener.open(request, timeout=30) as response:
-                          require(response.status == 200, "http_status")
-                          raw = response.read(MAX_RESPONSE + 1)
-                      require(len(raw) <= MAX_RESPONSE, "response_limit")
-                      value = decode(raw)
-                      require(isinstance(value, dict) and value.get("success") is True
-                              and not value.get("errors") and isinstance(value.get("result"), dict),
-                              "api_response")
-                      return value["result"]
-                  except Refusal:
-                      raise
-                  except urllib.error.HTTPError as error:
-                      try:
-                          error.close()
-                      finally:
-                          raise Refusal("request_unavailable") from None
-                  except Exception:
-                      # Never include remote errors, URLs, headers or response bodies in output.
-                      raise Refusal("request_unavailable") from None
-
-          def version_id(value):
-              require(isinstance(value, str) and
-                      re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value), "version_id")
-              return value
-
-          def binding_map(settings):
-              rows = settings.get("bindings")
-              require(isinstance(rows, list), "bindings_missing")
-              result = {}
-              for row in rows:
-                  require(isinstance(row, dict) and isinstance(row.get("name"), str)
-                          and row["name"] and isinstance(row.get("type"), str), "binding_shape")
-                  require(row["name"] not in result, "duplicate_binding")
-                  result[row["name"]] = row
-              return result
-
-          def writable_annotations(settings):
-              annotations = settings.get("annotations", {})
-              require(isinstance(annotations, dict) and
-                      set(annotations) <= {"workers/message", "workers/tag", "workers/triggered_by"}
-                      and all(isinstance(v, str) for v in annotations.values()), "annotation_shape")
-              return {key: value for key, value in annotations.items() if key != "workers/triggered_by"}
-
-          def comparable_settings(settings):
-              result = copy.deepcopy(settings)
-              result["bindings"] = binding_map(result)
-              # Only this documented, server-set annotation may change. Empty/absent
-              # annotations both mean there is no writable annotation to preserve.
-              result["annotations"] = writable_annotations(result)
-              return result
-
-          def snapshot(api):
-              settings = api.request("GET", "/settings")
-              comparable_settings(settings)
-              versions = api.request("GET", "/versions?per_page=1").get("items")
-              require(isinstance(versions, list) and len(versions) == 1, "latest_version_shape")
-              latest = version_id(versions[0].get("id"))
-              deployments = api.request("GET", "/deployments").get("deployments")
-              require(isinstance(deployments, list) and deployments, "deployment_missing")
-              deployment = deployments[0]
-              active = deployment.get("versions")
-              require(isinstance(active, list) and len(active) == 1
-                      and active[0].get("percentage") == 100
-                      and active[0].get("version_id") == latest, "latest_not_fully_deployed")
-              version = api.request("GET", "/versions/" + latest)
-              require(version.get("id") == latest, "version_identity")
-              resources = version.get("resources", {})
-              script = resources.get("script", {})
-              require(isinstance(script.get("etag"), str) and script["etag"]
-                      and isinstance(resources.get("script_runtime"), dict), "code_identity_missing")
-              code = {key: script[key] for key in ("etag", "handlers", "named_handlers") if key in script}
-              return {"settings": settings, "version": latest, "deployment": deployment,
-                      "code": code, "runtime": resources["script_runtime"]}
-
-          def proposal(settings):
-              bindings = binding_map(settings)
-              values = {}
-              for key in (TARGET, *GUARD_LIMITS):
-                  row = bindings.get(key)
-                  require(row is not None and set(row) == {"name", "type", "text"}
-                          and row["type"] == "plain_text" and isinstance(row["text"], str),
-                          "capacity_binding_type")
-                  value = row["text"]
-                  require(re.fullmatch(r"[0-9]{1,16}", value) and
-                          0 < int(value) <= 9007199254740991, "capacity_limit_invalid")
-                  values[key] = value
-              require(values[TARGET] in ("10", "20"), "owner_limit_changed")
-              require(all(int(values[key]) >= 20 for key in GUARD_LIMITS), "surrounding_limit_too_low")
-              replacement = {"name": TARGET, "type": "plain_text", "text": "20"}
-              desired = copy.deepcopy(settings)
-              desired["bindings"] = [copy.deepcopy(row) for name, row in bindings.items()
-                                     if name != TARGET] + [replacement]
-              # Inherit the opaque admin membership and every other binding unchanged.
-              patch = {"bindings": [{"name": name, "type": "inherit"} for name in bindings
-                                    if name != TARGET] + [replacement],
-                       "annotations": writable_annotations(settings)}
-              return desired, patch, int(values[TARGET])
-
-          def context():
-              require(os.environ.get("GITHUB_REPOSITORY") == "openclaw/crabbox"
-                      and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
-                      and os.environ.get("GITHUB_REF") == BRANCH
-                      and os.environ.get("GITHUB_WORKFLOW_REF") ==
-                          "openclaw/crabbox/.github/workflows/coordinator-deploy.yml@" + BRANCH
-                      and re.fullmatch(r"[0-9a-f]{40}", os.environ.get("GITHUB_SHA", ""))
-                      and os.environ.get("GITHUB_WORKFLOW_SHA") == os.environ["GITHUB_SHA"]
-                      and os.environ.get("GITHUB_RUN_ATTEMPT") == "1", "workflow_identity")
-              token = os.environ.pop("CLOUDFLARE_API_TOKEN", "")
-              require(bool(token) and not any(c.isspace() for c in token), "token_unavailable")
-              return token
-
-          def main():
-              attempted = False
-              confirmed = False
-              expected_hash = None
-              try:
-                  api = Cloudflare(context())
-                  before = snapshot(api)
-                  desired, patch, original_limit = proposal(before["settings"])
-                  # Read the same live identity and full settings immediately before
-                  # writing. The workflow concurrency group serializes repo deploys;
-                  # Cloudflare does not provide a conditional settings PATCH here.
-                  require(snapshot(api) == before, "prewrite_changed")
-                  if comparable_settings(desired) == comparable_settings(before["settings"]):
-                      print(json.dumps({"status": "already_present", "patch_attempts": 0,
-                                        "owner_limit": original_limit}))
-                      return 0
-                  expected_hash = hashlib.sha256(json.dumps(comparable_settings(desired), sort_keys=True,
-                      separators=(",", ":"), allow_nan=False).encode()).hexdigest()
-                  attempted = True
-                  try:
-                      api.request("PATCH", "/settings", patch)
-                      confirmed = True
-                  except Refusal:
-                      pass  # Ambiguous response: observe only. Never retry the PATCH.
-                  after = snapshot(api)
-                  require(comparable_settings(after["settings"]) == comparable_settings(desired),
-                          "postwrite_settings_mismatch")
-                  require(after["code"] == before["code"] and after["runtime"] == before["runtime"],
-                          "postwrite_code_mismatch")
-                  print(json.dumps({"status": "applied_readback_verified", "patch_attempts": 1,
-                                    "patch_response_confirmed": confirmed, "owner_limit": 20,
-                                    "original_owner_limit": original_limit, "code_unchanged": True,
-                                    "conditional_restore_target": 10, "restore_requires_review": True,
-                                    "expected_settings_sha256": expected_hash,
-                                    "before_version": before["version"], "after_version": after["version"]}))
-                  return 0
-              except Exception as exc:
-                  print(json.dumps({"status": "requires_reconciliation" if attempted else "refused",
-                                    "reason": str(exc) if isinstance(exc, Refusal) else "unexpected_shape",
-                                    "patch_attempts": int(attempted),
-                                    "patch_response_confirmed": confirmed,
-                                    **({"expected_settings_sha256": expected_hash} if attempted else {})}))
-                  return 1
-
-          if __name__ == "__main__":
-              sys.exit(main())
-          PY
+          node --input-type=module <<'JS'
+          const ACCOUNT = "91b59577e757131d68d55a471fe32aca";
+          const WORKER = "crabbox-coordinator";
+          const BASE = "https://api.cloudflare.com/client/v4/accounts/" + ACCOUNT + "/workers/scripts/" + WORKER + "/tails";
+          const BRANCH = "refs/heads/ops/capacity-settings-20261011";
+          const MAX_INCOMING = 2 * 1024 * 1024;
+          const MAX_OUTPUT = 64 * 1024;
+          const MAX_EVENTS = 200;
+          const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+          class Refusal extends Error {}
+          function requireFact(condition, code) { if (!condition) throw new Refusal(code); }
+          function context() {
+            const e = process.env;
+            requireFact(e.GITHUB_REPOSITORY === "openclaw/crabbox" && e.GITHUB_EVENT_NAME === "workflow_dispatch" &&
+              e.GITHUB_REF === BRANCH && e.GITHUB_WORKFLOW_REF ===
+              "openclaw/crabbox/.github/workflows/coordinator-deploy.yml@" + BRANCH &&
+              /^[0-9a-f]{40}$/.test(e.GITHUB_SHA || "") && e.GITHUB_WORKFLOW_SHA === e.GITHUB_SHA &&
+              e.GITHUB_RUN_ATTEMPT === "1", "workflow_identity");
+            requireFact(typeof WebSocket === "function" && typeof fetch === "function", "runtime_unavailable");
+            const token = e.CLOUDFLARE_API_TOKEN;
+            delete e.CLOUDFLARE_API_TOKEN;
+            requireFact(typeof token === "string" && token.length > 0 && !/\s/.test(token), "token_unavailable");
+            return token;
+          }
+          async function request(token, method, id, state) {
+            requireFact((method === "POST" && id === null) ||
+              (method === "DELETE" && /^[A-Za-z0-9_-]{1,32}$/.test(id)), "request_scope");
+            try {
+              const response = await fetch(BASE + (id === null ? "" : "/" + id), {
+                method, redirect: "error", signal: AbortSignal.timeout(30000),
+                headers: { Authorization: "Bearer " + token, "Content-Type": "application/json", Accept: "application/json" },
+                ...(method === "POST" ? { body: "{}" } : {})
+              });
+              const slot = method === "POST" ? "create" : "delete";
+              state[slot + "_http_status"] = response.status;
+              const reader = response.body.getReader();
+              const chunks = []; let bytes = 0;
+              try {
+                while (true) {
+                  const part = await reader.read();
+                  if (part.done) break;
+                  bytes += part.value.byteLength;
+                  requireFact(bytes <= 128 * 1024, "api_response_limit");
+                  chunks.push(part.value);
+                }
+              } finally { await reader.cancel(); }
+              let value;
+              try { value = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+              catch { throw new Refusal(response.status === 200 ? "api_json" : "http_status"); }
+              const codes = new Set([10000, 1101]);
+              const errors = Array.isArray(value?.errors) ? value.errors.slice(0, 16) : [];
+              state[slot + "_error_codes"] = errors.map(item => item?.code).filter(code => codes.has(code));
+              state[slot + "_other_error_count"] = errors.filter(item => !codes.has(item?.code)).length;
+              requireFact(response.status === 200, "http_status");
+              requireFact(value && value.success === true && Array.isArray(value.errors) && value.errors.length === 0,
+                "api_response");
+              return value.result;
+            } catch (error) {
+              if (error instanceof Refusal) throw error;
+              throw new Refusal("request_unavailable");
+            }
+          }
+          function tailUrl(value) {
+            requireFact(typeof value === "string" && value.length <= 2048, "tail_url_shape");
+            let url;
+            try { url = new URL(value); } catch { throw new Refusal("tail_url_shape"); }
+            // This documented Tail authority is admitted narrowly; unsupported API shapes stop with cleanup.
+            requireFact(url.protocol === "wss:" && url.hostname === "tail.developers.workers.dev" &&
+              !url.username && !url.password && !url.hash && (!url.port || url.port === "443") &&
+              url.pathname.length > 1 && url.pathname.length <= 1024, "tail_url_authority");
+            return url.href;
+          }
+          function category(message) {
+            const text = typeof message === "string" ? message.slice(0, 8192).toLowerCase() : "";
+            if (/durable object.*(?:reset|restart)|(?:reset|restart).*durable object/.test(text)) return "durable_object_reset";
+            if (/sqlite|sql syntax|sql query|sql error/.test(text)) return "sql";
+            if (/storage|database|transaction/.test(text)) return "storage";
+            if (/memory|heap|out of memory/.test(text)) return "memory";
+            if (/cpu|execution time|time limit/.test(text)) return "cpu";
+            if (/(?:cancel|abort|disconnect).*(?:i\/o|io|request|operation)|(?:i\/o|io).*cancel/.test(text)) return "canceled_io";
+            if (/typeerror|referenceerror|rangeerror|syntaxerror|is not (?:defined|a function)/.test(text)) return "javascript";
+            return "unknown";
+          }
+          function project(value) {
+            requireFact(value && typeof value === "object" && !Array.isArray(value), "event_shape");
+            const outcomes = new Set(["ok", "exception", "exceededCpu", "exceededMemory", "canceled",
+              "scriptNotFound", "responseStreamDisconnected", "unknown"]);
+            const names = new Set(["Error", "TypeError", "ReferenceError", "RangeError", "SyntaxError",
+              "URIError", "EvalError", "AggregateError", "DOMException"]);
+            const timestamp = Number.isSafeInteger(value.eventTimestamp) &&
+              value.eventTimestamp >= 946684800000 && value.eventTimestamp < 4102444800000
+                ? new Date(value.eventTimestamp).toISOString() : null;
+            const exceptions = (Array.isArray(value.exceptions) ? value.exceptions : []).slice(0, 4).map(item => {
+              const entry = item && typeof item === "object" ? item : {};
+              const stack = typeof entry.stack === "string" ? entry.stack.slice(0, 8192) : "";
+              const frames = [];
+              const pattern = /(?:^|[\s(/\\])(worker\.js|index\.js|index\.ts|fleet\.ts|storage\.ts|usage\.ts|org-records\.ts|postgres-store\.ts|coordinator-runtime\.ts|auth\.ts):([0-9]{1,7}):([0-9]{1,7})(?=$|[\s)])/g;
+              for (const match of stack.matchAll(pattern)) {
+                if (frames.length === 2) break;
+                frames.push({ source: match[1], line: Number(match[2]), column: Number(match[3]) });
+              }
+              return { name: names.has(entry.name) ? entry.name : "unknown", category: category(entry.message), frames };
+            });
+            return { timestamp, outcome: outcomes.has(value.outcome) ? value.outcome : "unknown",
+              script_version: UUID.test(value.scriptVersion?.id || "") ? value.scriptVersion.id : null, exceptions };
+          }
+          async function observe(url, state) {
+            return await new Promise(resolve => {
+              let settled = false; let openTimer; let observationTimer;
+              const finish = reason => {
+                if (settled) return;
+                settled = true; state.reason = reason;
+                clearTimeout(openTimer); clearTimeout(observationTimer);
+                try { state.socket.close(1000, "bounded observation complete"); state.socket_close_requested = true; }
+                catch { state.socket_close_requested = false; }
+                resolve();
+              };
+              try {
+                // The capability URL authenticates the socket. Never forward the API token.
+                state.socket = new WebSocket(url, "trace-v1");
+                state.socket.binaryType = "arraybuffer";
+                openTimer = setTimeout(() => finish("websocket_open_timeout"), 15000);
+                state.socket.addEventListener("open", () => {
+                  if (settled) return;
+                  try {
+                    clearTimeout(openTimer); state.connected = true;
+                    state.socket.send(JSON.stringify({ debug: false }));
+                    observationTimer = setTimeout(() => finish("observation_elapsed"), 60000);
+                  } catch { finish("websocket_send_failed"); }
+                });
+                state.socket.addEventListener("message", event => {
+                  if (settled) return;
+                  try {
+                    const raw = typeof event.data === "string" ? Buffer.from(event.data, "utf8") :
+                      event.data instanceof ArrayBuffer ? Buffer.from(event.data) : null;
+                    if (!raw) return finish("websocket_frame_shape");
+                    state.incoming_bytes += raw.length;
+                    if (state.incoming_bytes > MAX_INCOMING) return finish("incoming_limit");
+                    state.events_seen += 1;
+                    let row;
+                    try { row = project(JSON.parse(raw.toString("utf8"))); }
+                    catch { state.invalid_events += 1; }
+                    if (row) {
+                      const encoded = JSON.stringify(row);
+                      if (state.projected_bytes + Buffer.byteLength(encoded) + 1 > MAX_OUTPUT - 4096)
+                        return finish("safe_output_limit");
+                      state.events.push(row); state.projected_bytes += Buffer.byteLength(encoded) + 1;
+                    }
+                    if (state.events_seen >= MAX_EVENTS) finish("event_limit");
+                  } catch { finish("event_unavailable"); }
+                });
+                state.socket.addEventListener("error", () => finish("websocket_error"));
+                state.socket.addEventListener("close", () => finish("websocket_closed"));
+              } catch { finish("websocket_unavailable"); }
+            });
+          }
+          async function main() {
+            const state = { create_attempts: 0, created: false, tail_id: null, expires_at: null,
+              connected: false, socket_close_requested: false, delete_attempts: 0, cleanup_confirmed: false,
+              events_seen: 0, incoming_bytes: 0, invalid_events: 0, projected_bytes: 0, events: [], reason: null };
+            state.create_http_status = null; state.delete_http_status = null;
+            state.create_error_codes = []; state.delete_error_codes = [];
+            state.create_other_error_count = 0; state.delete_other_error_count = 0;
+            let token;
+            try {
+              token = context(); state.create_attempts = 1;
+              const result = await request(token, "POST", null, state);
+              requireFact(result && typeof result.id === "string" && /^[A-Za-z0-9_-]{1,32}$/.test(result.id), "tail_id_shape");
+              state.tail_id = result.id; state.created = true;
+              const expiry = typeof result.expires_at === "string" ? Date.parse(result.expires_at) : NaN;
+              if (Number.isFinite(expiry) && expiry >= 0 && expiry < 4102444800000)
+                state.expires_at = new Date(expiry).toISOString();
+              requireFact(state.expires_at !== null && expiry > Date.now() + 90000, "tail_expired_or_invalid");
+              await observe(tailUrl(result.url), state);
+            } catch (error) {
+              state.reason = error instanceof Refusal ? error.message : "unexpected_shape";
+            } finally {
+              if (state.tail_id !== null) {
+                state.delete_attempts = 1;
+                try { await request(token, "DELETE", state.tail_id, state); state.cleanup_confirmed = true; }
+                catch { state.cleanup_confirmed = false; }
+              }
+            }
+            const status = state.connected && state.cleanup_confirmed &&
+              ["observation_elapsed", "event_limit", "incoming_limit", "safe_output_limit"].includes(state.reason)
+                ? "observed" : state.create_attempts ? "requires_reconciliation" : "refused";
+            const tail_fingerprint = state.tail_id === null ? null :
+              Buffer.from(await crypto.subtle.digest("SHA-256", Buffer.from(state.tail_id))).toString("hex");
+            const { socket, projected_bytes, tail_id, ...safe } = state;
+            safe.tail_fingerprint = tail_fingerprint;
+            safe.omitted_events = state.events_seen - state.invalid_events - state.events.length;
+            const output = JSON.stringify({ kind: "bounded_passive_worker_tail", status, ...safe });
+            requireFact(Buffer.byteLength(output) <= MAX_OUTPUT, "final_output_limit");
+            process.stdout.write(output + "\n");
+            process.exitCode = status === "observed" ? 0 : 1;
+          }
+          main().catch(() => { process.stdout.write('{"kind":"bounded_passive_worker_tail","status":"requires_reconciliation","reason":"output_unavailable"}\n'); process.exitCode = 1; });
+          JS
