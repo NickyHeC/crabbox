@@ -1,4 +1,4 @@
-name: Coordinator failure telemetry diagnostics
+name: Coordinator temporary owner capacity
 
 # Operations branch only: do not merge this replacement of the deploy workflow.
 on:
@@ -17,41 +17,30 @@ jobs:
     timeout-minutes: 10
     environment: coordinator
     steps:
-      - name: Read the reviewed failure telemetry
+      - name: Apply the reviewed owner capacity setting
         shell: bash
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           python3 -I -B - <<'PY'
-          import json
+          import copy
           import hashlib
-          from datetime import datetime, timezone
+          import json
           import os
           import re
           import sys
           import urllib.error
           import urllib.request
+          import uuid
 
           ACCOUNT = "91b59577e757131d68d55a471fe32aca"
           WORKER = "crabbox-coordinator"
-          BASE = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/workers"
-          SETTINGS = f"/scripts/{WORKER}/settings"
-          TARGET = "CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER"
-          TELEMETRY = "/observability/telemetry/query"
+          BASE = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/workers/scripts/{WORKER}"
           BRANCH = "refs/heads/ops/capacity-settings-20261011"
+          TARGET = "CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER"
+          GUARD_LIMITS = ("CRABBOX_MAX_ACTIVE_LEASES", "CRABBOX_MAX_ACTIVE_LEASES_PER_ORG",
+                          "CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN")
           MAX_RESPONSE = 2 * 1024 * 1024
-          MAX_PROJECTED_ROWS = 48 * 1024
-          # Existing events only. A dry query does not save a query or change logging.
-          QUERY = {"queryId": "coordinator-failure-20261012", "dry": True,
-                   "timeframe": {"from": 1791764640000, "to": 1791765060000},
-                   "view": "events", "limit": 200,
-                   "parameters": {"filters": [{"key": "$workers.scriptName", "operation": "eq",
-                                               "type": "string", "value": WORKER}]}}
-          SOURCE_FILES = {"index.js", "src/index.ts", "src/fleet.ts", "src/coordinator-entry.ts",
-                          "src/coordinator-runtime.ts", "src/aws.ts", "src/provider-key.ts",
-                          "node_modules/ssh2/lib/keygen.js", "node_modules/ssh2/lib/protocol/keyParser.js"}
-          ERROR_NAMES = {"Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError",
-                         "URIError", "EvalError", "AggregateError", "DOMException"}
 
           class Refusal(Exception):
               pass
@@ -79,55 +68,120 @@ jobs:
               def __init__(self, token):
                   self.token = token
                   self.opener = urllib.request.build_opener(NoRedirect())
-                  self.attempted = set()
-                  self.observation = {}
 
-              def read_response(self, response):
-                  status = getattr(response, "status", None) or getattr(response, "code", None)
-                  require(type(status) is int and 100 <= status <= 599, "http_status_shape")
-                  self.observation["http_status"] = status
-                  raw = response.read(MAX_RESPONSE + 1)
-                  require(len(raw) <= MAX_RESPONSE, "response_limit")
-                  try:
-                      value = decode(raw)
-                  except Exception:
-                      raise Refusal("response_json") from None
-                  require(isinstance(value, dict), "api_response_shape")
-                  errors = value.get("errors")
-                  if isinstance(errors, list) and len(errors) <= 64:
-                      self.observation["api_error_codes"] = sorted({item["code"] for item in errors
-                          if isinstance(item, dict) and type(item.get("code")) is int
-                          and 0 <= item["code"] <= 2147483647})
-                  else:
-                      self.observation["api_error_codes"] = []
-                  require(status == 200, "http_status")
-                  require(value.get("success") is True and not errors, "api_response")
-                  require(isinstance(value.get("result"), dict), "api_result_shape")
-                  return value["result"]
-
-              def request(self, method, path, query=None):
-                  require((method == "POST" and path == TELEMETRY and query == QUERY)
-                          or (method == "GET" and path == SETTINGS and query is None), "request_scope")
-                  require(path not in self.attempted, "request_already_attempted")
-                  self.attempted.add(path)
-                  self.observation = {}
-                  headers = {"Authorization": "Bearer " + self.token, "Accept": "application/json",
-                             "Content-Type": "application/json"}
-                  body = None if query is None else json.dumps(query, separators=(",", ":"), allow_nan=False).encode()
+              def request(self, method, path, settings=None):
+                  require((method == "PATCH" and path == "/settings" and settings is not None)
+                          or (method == "GET" and settings is None and
+                              (path in ("/settings", "/versions?per_page=1", "/deployments")
+                               or re.fullmatch(r"/versions/[0-9a-f-]{36}", path))), "request_scope")
+                  headers = {"Authorization": "Bearer " + self.token, "Accept": "application/json"}
+                  body = None
+                  if settings is not None:
+                      boundary = "capacity-" + uuid.uuid4().hex
+                      raw = json.dumps(settings, separators=(",", ":"), allow_nan=False).encode()
+                      body = (f'--{boundary}\r\nContent-Disposition: form-data; name="settings"\r\n'
+                              'Content-Type: application/json\r\n\r\n').encode() + raw
+                      body += f"\r\n--{boundary}--\r\n".encode()
+                      headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
                   request = urllib.request.Request(BASE + path, data=body, headers=headers, method=method)
                   try:
-                      try:
-                          response = self.opener.open(request, timeout=30)
-                      except urllib.error.HTTPError as error:
-                          response = error
-                      try:
-                          return self.read_response(response)
-                      finally:
-                          response.close()
+                      with self.opener.open(request, timeout=30) as response:
+                          require(response.status == 200, "http_status")
+                          raw = response.read(MAX_RESPONSE + 1)
+                      require(len(raw) <= MAX_RESPONSE, "response_limit")
+                      value = decode(raw)
+                      require(isinstance(value, dict) and value.get("success") is True
+                              and not value.get("errors") and isinstance(value.get("result"), dict),
+                              "api_response")
+                      return value["result"]
                   except Refusal:
                       raise
+                  except urllib.error.HTTPError as error:
+                      try:
+                          error.close()
+                      finally:
+                          raise Refusal("request_unavailable") from None
                   except Exception:
+                      # Never include remote errors, URLs, headers or response bodies in output.
                       raise Refusal("request_unavailable") from None
+
+          def version_id(value):
+              require(isinstance(value, str) and
+                      re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value), "version_id")
+              return value
+
+          def binding_map(settings):
+              rows = settings.get("bindings")
+              require(isinstance(rows, list), "bindings_missing")
+              result = {}
+              for row in rows:
+                  require(isinstance(row, dict) and isinstance(row.get("name"), str)
+                          and row["name"] and isinstance(row.get("type"), str), "binding_shape")
+                  require(row["name"] not in result, "duplicate_binding")
+                  result[row["name"]] = row
+              return result
+
+          def writable_annotations(settings):
+              annotations = settings.get("annotations", {})
+              require(isinstance(annotations, dict) and
+                      set(annotations) <= {"workers/message", "workers/tag", "workers/triggered_by"}
+                      and all(isinstance(v, str) for v in annotations.values()), "annotation_shape")
+              return {key: value for key, value in annotations.items() if key != "workers/triggered_by"}
+
+          def comparable_settings(settings):
+              result = copy.deepcopy(settings)
+              result["bindings"] = binding_map(result)
+              # Only this documented, server-set annotation may change. Empty/absent
+              # annotations both mean there is no writable annotation to preserve.
+              result["annotations"] = writable_annotations(result)
+              return result
+
+          def snapshot(api):
+              settings = api.request("GET", "/settings")
+              comparable_settings(settings)
+              versions = api.request("GET", "/versions?per_page=1").get("items")
+              require(isinstance(versions, list) and len(versions) == 1, "latest_version_shape")
+              latest = version_id(versions[0].get("id"))
+              deployments = api.request("GET", "/deployments").get("deployments")
+              require(isinstance(deployments, list) and deployments, "deployment_missing")
+              deployment = deployments[0]
+              active = deployment.get("versions")
+              require(isinstance(active, list) and len(active) == 1
+                      and active[0].get("percentage") == 100
+                      and active[0].get("version_id") == latest, "latest_not_fully_deployed")
+              version = api.request("GET", "/versions/" + latest)
+              require(version.get("id") == latest, "version_identity")
+              resources = version.get("resources", {})
+              script = resources.get("script", {})
+              require(isinstance(script.get("etag"), str) and script["etag"]
+                      and isinstance(resources.get("script_runtime"), dict), "code_identity_missing")
+              code = {key: script[key] for key in ("etag", "handlers", "named_handlers") if key in script}
+              return {"settings": settings, "version": latest, "deployment": deployment,
+                      "code": code, "runtime": resources["script_runtime"]}
+
+          def proposal(settings):
+              bindings = binding_map(settings)
+              values = {}
+              for key in (TARGET, *GUARD_LIMITS):
+                  row = bindings.get(key)
+                  require(row is not None and set(row) == {"name", "type", "text"}
+                          and row["type"] == "plain_text" and isinstance(row["text"], str),
+                          "capacity_binding_type")
+                  value = row["text"]
+                  require(re.fullmatch(r"[0-9]{1,16}", value) and
+                          0 < int(value) <= 9007199254740991, "capacity_limit_invalid")
+                  values[key] = value
+              require(values[TARGET] in ("10", "20"), "owner_limit_changed")
+              require(all(int(values[key]) >= 20 for key in GUARD_LIMITS), "surrounding_limit_too_low")
+              replacement = {"name": TARGET, "type": "plain_text", "text": "20"}
+              desired = copy.deepcopy(settings)
+              desired["bindings"] = [copy.deepcopy(row) for name, row in bindings.items()
+                                     if name != TARGET] + [replacement]
+              # Inherit the opaque admin membership and every other binding unchanged.
+              patch = {"bindings": [{"name": name, "type": "inherit"} for name in bindings
+                                    if name != TARGET] + [replacement],
+                       "annotations": writable_annotations(settings)}
+              return desired, patch, int(values[TARGET])
 
           def context():
               require(os.environ.get("GITHUB_REPOSITORY") == "openclaw/crabbox"
@@ -142,156 +196,48 @@ jobs:
               require(bool(token) and not any(c.isspace() for c in token), "token_unavailable")
               return token
 
-          def safe_identifier(value, pattern, reason):
-              require(isinstance(value, str) and re.fullmatch(pattern, value), reason)
-              return value
-
-          # Telemetry documents source as string | unknown object, not a typed exception.
-          # Recognize only explicit error strings/objects; do not traverse arbitrary logs.
-          def exception_observation(event):
-              texts = []
-              names = []
-              metadata = event.get("$metadata")
-              if isinstance(metadata, dict) and isinstance(metadata.get("error"), str):
-                  texts.append(metadata["error"])
-              source = event.get("source")
-              if isinstance(source, str):
-                  texts.append(source)
-              elif isinstance(source, dict):
-                  for field in ("message", "stack"):
-                      if isinstance(source.get(field), str):
-                          texts.append(source[field])
-                  if isinstance(source.get("name"), str):
-                      names.append(source["name"])
-                  error = source.get("error")
-                  if isinstance(error, dict):
-                      if isinstance(error.get("name"), str):
-                          names.append(error["name"])
-                      for field in ("message", "stack"):
-                          if isinstance(error.get(field), str):
-                              texts.append(error[field])
-              category = next((name for name in names if name in ERROR_NAMES), "unrecognized")
-              locations = []
-              omitted = False
-              for text in texts:
-                  if len(text) > 16384:
-                      omitted = True
-                      continue
-                  first = text.split("\n", 1)[0].split(":", 1)[0]
-                  if category == "unrecognized" and first in ERROR_NAMES:
-                      category = first
-                  for line in text.splitlines():
-                      if not line.lstrip().startswith("at "):
-                          continue
-                      match = re.fullmatch(r"[ \t]{0,16}at (?:[^()\r\n]{1,160} \()?([^()\s]+):([0-9]{1,7}):([0-9]{1,7})\)?", line)
-                      if not match or match[1] not in SOURCE_FILES or not 1 <= int(match[2]) <= 9999999 or not 1 <= int(match[3]) <= 9999999:
-                          omitted = True
-                          continue
-                      location = {"file": match[1], "line": int(match[2]), "column": int(match[3])}
-                      if location not in locations:
-                          if len(locations) < 4:
-                              locations.append(location)
-                          else:
-                              omitted = True
-              return {"status": "recognized" if category != "unrecognized" or locations else "unrecognized",
-                      "category": category, "locations": locations, "unrecognized_or_omitted_frames": omitted}
-
-          def telemetry_observation(result):
-              events = result.get("events")
-              require(isinstance(events, dict) and isinstance(events.get("events"), list)
-                      and len(events["events"]) <= 200, "telemetry_events_shape")
-              rows = []
-              encoded_rows_bytes = 2
-              omitted_projected_events = 0
-              for event in events["events"]:
-                  require(isinstance(event, dict), "telemetry_event_shape")
-                  facts = event.get("$workers")
-                  require(isinstance(facts, dict) and facts.get("scriptName") == WORKER, "telemetry_script_scope")
-                  timestamp = event.get("timestamp")
-                  require(type(timestamp) in (int, float) and QUERY["timeframe"]["from"] <= timestamp
-                          <= QUERY["timeframe"]["to"], "telemetry_time_scope")
-                  row = {"scriptName": WORKER, "timestamp": timestamp}
-                  version = facts.get("scriptVersion")
-                  if version is not None:
-                      require(isinstance(version, dict), "telemetry_version_shape")
-                      if version.get("id") is not None:
-                          row["scriptVersion"] = {"id": safe_identifier(version["id"],
-                              r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", "telemetry_version_id")}
-                  for name, pattern in (("requestId", r"[0-9a-fA-F-]{16,64}"), ("durableObjectId", r"[0-9a-f]{64}")):
-                      if facts.get(name) is not None:
-                          row[name] = safe_identifier(facts[name], pattern, "telemetry_identifier")
-                  if facts.get("outcome") is not None:
-                      allowed = {"ok", "exception", "canceled", "exceededCpu", "exceededMemory",
-                                 "memoryLimitExceeded", "cpuLimitExceeded", "unknown"}
-                      row["outcome"] = facts["outcome"] if isinstance(facts["outcome"], str) and facts["outcome"] in allowed else "other"
-                  row["exception"] = exception_observation(event)
-                  metadata = event.get("$metadata")
-                  if isinstance(metadata, dict) and type(metadata.get("statusCode")) is int and 100 <= metadata["statusCode"] <= 599:
-                      row["statusCode"] = metadata["statusCode"]
-                  if row not in rows:
-                      row_bytes = len(json.dumps(row, allow_nan=False).encode()) + (2 if rows else 0)
-                      if encoded_rows_bytes + row_bytes <= MAX_PROJECTED_ROWS:
-                          rows.append(row)
-                          encoded_rows_bytes += row_bytes
-                      else:
-                          # Count input events whose projection is absent from the retained rows.
-                          omitted_projected_events += 1
-              return {"status": "observed", "returned_events": len(events["events"]),
-                      "at_limit": len(events["events"]) == 200, "invocations": rows,
-                      "omitted_projected_events": omitted_projected_events,
-                      "truncated_projection": omitted_projected_events > 0}
-
-          def settings_observation(settings):
-              rows = settings.get("bindings")
-              require(isinstance(rows, list), "settings_bindings_shape")
-              bindings = {}
-              for row in rows:
-                  require(isinstance(row, dict) and isinstance(row.get("name"), str)
-                          and row["name"] not in bindings, "settings_binding_shape")
-                  bindings[row["name"]] = row
-              normalized = dict(settings, bindings=sorted(rows, key=lambda row: row["name"]))
-              settings_hash = hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(",", ":"),
-                                                        ensure_ascii=False, allow_nan=False).encode()).hexdigest()
-              target = bindings.get(TARGET)
-              projected = {"present": target is not None}
-              if target is not None:
-                  kind = target.get("type")
-                  projected["type"] = kind if kind in ("plain_text", "secret_text") else "other"
-                  if kind == "plain_text":
-                      text = target.get("text")
-                      require(isinstance(text, str) and re.fullmatch(r"[1-9][0-9]{0,9}", text)
-                              and int(text) <= 2147483647, "owner_limit_shape")
-                      projected["value"] = int(text)
-              return {"owner_limit": projected, "normalized_settings_sha256": settings_hash,
-                      "observed_at": datetime.now(timezone.utc).isoformat()}
-
           def main():
-              output = {"status": "refused", "read_only": True, "patch_attempts": 0,
-                        "settings_reads": 0, "telemetry_queries": 0, "api": {}}
+              attempted = False
+              confirmed = False
+              expected_hash = None
               try:
                   api = Cloudflare(context())
-                  complete = True
-                  for label, method, path, query, project in (
-                      ("settings", "GET", SETTINGS, None, settings_observation),
-                      ("telemetry", "POST", TELEMETRY, QUERY, telemetry_observation),
-                  ):
-                      output["settings_reads" if label == "settings" else "telemetry_queries"] = 1
-                      try:
-                          output[label] = project(api.request(method, path, query))
-                      except Exception as exc:
-                          complete = False
-                          output[label] = {"status": "refused", "reason": str(exc) if isinstance(exc, Refusal) else "unexpected_shape"}
-                      output["api"][label] = api.observation
-                  output["status"] = "diagnostics_observed" if complete else "diagnostics_incomplete"
-                  raw = json.dumps(output, allow_nan=False)
-                  require(len(raw.encode()) <= 65536, "output_limit")
-                  print(raw)
-                  return 0 if complete else 1
+                  before = snapshot(api)
+                  desired, patch, original_limit = proposal(before["settings"])
+                  # Read the same live identity and full settings immediately before
+                  # writing. The workflow concurrency group serializes repo deploys;
+                  # Cloudflare does not provide a conditional settings PATCH here.
+                  require(snapshot(api) == before, "prewrite_changed")
+                  if comparable_settings(desired) == comparable_settings(before["settings"]):
+                      print(json.dumps({"status": "already_present", "patch_attempts": 0,
+                                        "owner_limit": original_limit}))
+                      return 0
+                  expected_hash = hashlib.sha256(json.dumps(comparable_settings(desired), sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+                  attempted = True
+                  try:
+                      api.request("PATCH", "/settings", patch)
+                      confirmed = True
+                  except Refusal:
+                      pass  # Ambiguous response: observe only. Never retry the PATCH.
+                  after = snapshot(api)
+                  require(comparable_settings(after["settings"]) == comparable_settings(desired),
+                          "postwrite_settings_mismatch")
+                  require(after["code"] == before["code"] and after["runtime"] == before["runtime"],
+                          "postwrite_code_mismatch")
+                  print(json.dumps({"status": "applied_readback_verified", "patch_attempts": 1,
+                                    "patch_response_confirmed": confirmed, "owner_limit": 20,
+                                    "original_owner_limit": original_limit, "code_unchanged": True,
+                                    "conditional_restore_target": 10, "restore_requires_review": True,
+                                    "expected_settings_sha256": expected_hash,
+                                    "before_version": before["version"], "after_version": after["version"]}))
+                  return 0
               except Exception as exc:
-                  output.pop("telemetry", None)
-                  output["status"] = "refused"
-                  output["reason"] = str(exc) if isinstance(exc, Refusal) else "unexpected_shape"
-                  print(json.dumps(output, allow_nan=False))
+                  print(json.dumps({"status": "requires_reconciliation" if attempted else "refused",
+                                    "reason": str(exc) if isinstance(exc, Refusal) else "unexpected_shape",
+                                    "patch_attempts": int(attempted),
+                                    "patch_response_confirmed": confirmed,
+                                    **({"expected_settings_sha256": expected_hash} if attempted else {})}))
                   return 1
 
           if __name__ == "__main__":
