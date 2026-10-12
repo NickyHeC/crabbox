@@ -1,4 +1,4 @@
-name: Coordinator temporary owner capacity
+name: Coordinator capacity serving diagnostics
 
 # Operations branch only: do not merge this replacement of the deploy workflow.
 on:
@@ -17,30 +17,34 @@ jobs:
     timeout-minutes: 10
     environment: coordinator
     steps:
-      - name: Apply the reviewed owner capacity setting
+      - name: Read the reviewed capacity serving metadata
         shell: bash
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           python3 -I -B - <<'PY'
-          import copy
-          import hashlib
           import json
           import os
           import re
           import sys
           import urllib.error
           import urllib.request
-          import uuid
 
           ACCOUNT = "91b59577e757131d68d55a471fe32aca"
           WORKER = "crabbox-coordinator"
-          BASE = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/workers/scripts/{WORKER}"
+          BASE = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/workers"
+          SETTINGS = f"/scripts/{WORKER}/settings"
+          NAMESPACES = "/durable_objects/namespaces?per_page=1000&page=1"
+          TELEMETRY = "/observability/telemetry/query"
           BRANCH = "refs/heads/ops/capacity-settings-20261011"
           TARGET = "CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER"
-          GUARD_LIMITS = ("CRABBOX_MAX_ACTIVE_LEASES", "CRABBOX_MAX_ACTIVE_LEASES_PER_ORG",
-                          "CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN")
           MAX_RESPONSE = 2 * 1024 * 1024
+          # Existing observations only, surrounding the single native capacity read.
+          QUERY = {"queryId": "capacity-serving-version-20261011", "dry": True,
+                   "timeframe": {"from": 1791762690000, "to": 1791762750000},
+                   "view": "events", "limit": 200,
+                   "parameters": {"filters": [{"key": "$workers.scriptName", "operation": "eq",
+                                               "type": "string", "value": WORKER}]}}
 
           class Refusal(Exception):
               pass
@@ -69,20 +73,14 @@ jobs:
                   self.token = token
                   self.opener = urllib.request.build_opener(NoRedirect())
 
-              def request(self, method, path, settings=None):
-                  require((method == "PATCH" and path == "/settings" and settings is not None)
-                          or (method == "GET" and settings is None and
-                              (path in ("/settings", "/versions?per_page=1", "/deployments")
-                               or re.fullmatch(r"/versions/[0-9a-f-]{36}", path))), "request_scope")
+              def request(self, method, path, query=None):
+                  require((method == "GET" and path in (SETTINGS, NAMESPACES) and query is None)
+                          or (method == "POST" and path == TELEMETRY and query == QUERY), "request_scope")
                   headers = {"Authorization": "Bearer " + self.token, "Accept": "application/json"}
                   body = None
-                  if settings is not None:
-                      boundary = "capacity-" + uuid.uuid4().hex
-                      raw = json.dumps(settings, separators=(",", ":"), allow_nan=False).encode()
-                      body = (f'--{boundary}\r\nContent-Disposition: form-data; name="settings"\r\n'
-                              'Content-Type: application/json\r\n\r\n').encode() + raw
-                      body += f"\r\n--{boundary}--\r\n".encode()
-                      headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
+                  if query is not None:
+                      headers["Content-Type"] = "application/json"
+                      body = json.dumps(query, separators=(",", ":"), allow_nan=False).encode()
                   request = urllib.request.Request(BASE + path, data=body, headers=headers, method=method)
                   try:
                       with self.opener.open(request, timeout=30) as response:
@@ -91,8 +89,9 @@ jobs:
                       require(len(raw) <= MAX_RESPONSE, "response_limit")
                       value = decode(raw)
                       require(isinstance(value, dict) and value.get("success") is True
-                              and not value.get("errors") and isinstance(value.get("result"), dict),
-                              "api_response")
+                              and not value.get("errors"), "api_response")
+                      expected = list if path == NAMESPACES else dict
+                      require(isinstance(value.get("result"), expected), "api_result_shape")
                       return value["result"]
                   except Refusal:
                       raise
@@ -102,13 +101,7 @@ jobs:
                       finally:
                           raise Refusal("request_unavailable") from None
                   except Exception:
-                      # Never include remote errors, URLs, headers or response bodies in output.
                       raise Refusal("request_unavailable") from None
-
-          def version_id(value):
-              require(isinstance(value, str) and
-                      re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value), "version_id")
-              return value
 
           def binding_map(settings):
               rows = settings.get("bindings")
@@ -120,68 +113,6 @@ jobs:
                   require(row["name"] not in result, "duplicate_binding")
                   result[row["name"]] = row
               return result
-
-          def writable_annotations(settings):
-              annotations = settings.get("annotations", {})
-              require(isinstance(annotations, dict) and
-                      set(annotations) <= {"workers/message", "workers/tag", "workers/triggered_by"}
-                      and all(isinstance(v, str) for v in annotations.values()), "annotation_shape")
-              return {key: value for key, value in annotations.items() if key != "workers/triggered_by"}
-
-          def comparable_settings(settings):
-              result = copy.deepcopy(settings)
-              result["bindings"] = binding_map(result)
-              # Only this documented, server-set annotation may change. Empty/absent
-              # annotations both mean there is no writable annotation to preserve.
-              result["annotations"] = writable_annotations(result)
-              return result
-
-          def snapshot(api):
-              settings = api.request("GET", "/settings")
-              comparable_settings(settings)
-              versions = api.request("GET", "/versions?per_page=1").get("items")
-              require(isinstance(versions, list) and len(versions) == 1, "latest_version_shape")
-              latest = version_id(versions[0].get("id"))
-              deployments = api.request("GET", "/deployments").get("deployments")
-              require(isinstance(deployments, list) and deployments, "deployment_missing")
-              deployment = deployments[0]
-              active = deployment.get("versions")
-              require(isinstance(active, list) and len(active) == 1
-                      and active[0].get("percentage") == 100
-                      and active[0].get("version_id") == latest, "latest_not_fully_deployed")
-              version = api.request("GET", "/versions/" + latest)
-              require(version.get("id") == latest, "version_identity")
-              resources = version.get("resources", {})
-              script = resources.get("script", {})
-              require(isinstance(script.get("etag"), str) and script["etag"]
-                      and isinstance(resources.get("script_runtime"), dict), "code_identity_missing")
-              code = {key: script[key] for key in ("etag", "handlers", "named_handlers") if key in script}
-              return {"settings": settings, "version": latest, "deployment": deployment,
-                      "code": code, "runtime": resources["script_runtime"]}
-
-          def proposal(settings):
-              bindings = binding_map(settings)
-              values = {}
-              for key in (TARGET, *GUARD_LIMITS):
-                  row = bindings.get(key)
-                  require(row is not None and set(row) == {"name", "type", "text"}
-                          and row["type"] == "plain_text" and isinstance(row["text"], str),
-                          "capacity_binding_type")
-                  value = row["text"]
-                  require(re.fullmatch(r"[0-9]{1,16}", value) and
-                          0 < int(value) <= 9007199254740991, "capacity_limit_invalid")
-                  values[key] = value
-              require(values[TARGET] in ("10", "20"), "owner_limit_changed")
-              require(all(int(values[key]) >= 20 for key in GUARD_LIMITS), "surrounding_limit_too_low")
-              replacement = {"name": TARGET, "type": "plain_text", "text": "20"}
-              desired = copy.deepcopy(settings)
-              desired["bindings"] = [copy.deepcopy(row) for name, row in bindings.items()
-                                     if name != TARGET] + [replacement]
-              # Inherit the opaque admin membership and every other binding unchanged.
-              patch = {"bindings": [{"name": name, "type": "inherit"} for name in bindings
-                                    if name != TARGET] + [replacement],
-                       "annotations": writable_annotations(settings)}
-              return desired, patch, int(values[TARGET])
 
           def context():
               require(os.environ.get("GITHUB_REPOSITORY") == "openclaw/crabbox"
@@ -196,49 +127,101 @@ jobs:
               require(bool(token) and not any(c.isspace() for c in token), "token_unavailable")
               return token
 
+          def safe_identifier(value, pattern, reason):
+              require(isinstance(value, str) and re.fullmatch(pattern, value), reason)
+              return value
+
+
+          def settings_observation(settings):
+              bindings = binding_map(settings)
+              owner = bindings.get(TARGET)
+              require(isinstance(owner, dict), "owner_limit_missing")
+              # Never interpret opaque binding content as the public numeric limit.
+              limit = {"type": owner["type"] if owner["type"] in ("plain_text", "secret_text") else "other"}
+              if owner["type"] == "plain_text":
+                  limit["text"] = safe_identifier(owner.get("text"), r"[0-9]{1,16}", "owner_limit_shape")
+              fleet = bindings.get("FLEET")
+              require(isinstance(fleet, dict) and fleet.get("type") == "durable_object_namespace",
+                      "fleet_binding_type")
+              projected = {"name": "FLEET", "type": "durable_object_namespace",
+                           "namespace_id": safe_identifier(fleet.get("namespace_id"), r"[0-9a-f]{32}", "fleet_id"),
+                           "class_name": safe_identifier(fleet.get("class_name"), r"[A-Za-z_][A-Za-z0-9_]{0,127}", "fleet_class")}
+              if fleet.get("script_name") is not None:
+                  projected["script_name"] = safe_identifier(fleet["script_name"], r"[A-Za-z0-9_-]{1,128}", "fleet_script")
+              for name in ("environment", "dispatch_namespace"):
+                  if fleet.get(name) is not None:
+                      projected[name] = safe_identifier(fleet[name], r"[A-Za-z0-9_-]{0,128}", "fleet_context")
+              return {"owner_limit": limit, "fleet_binding": projected}
+
+
+          def namespace_observation(rows, fleet):
+              require(len(rows) <= 1000, "namespace_limit")
+              found = [row for row in rows if isinstance(row, dict) and row.get("id") == fleet["namespace_id"]]
+              require(len(found) == 1, "fleet_namespace_not_unique_on_first_page")
+              row = found[0]
+              return {"id": fleet["namespace_id"],
+                      "class": safe_identifier(row.get("class"), r"[A-Za-z_][A-Za-z0-9_]{0,127}", "namespace_class"),
+                      "script": safe_identifier(row.get("script"), r"[A-Za-z0-9_-]{1,128}", "namespace_script")}
+
+
+          def telemetry_observation(result):
+              events = result.get("events")
+              require(isinstance(events, dict) and isinstance(events.get("events"), list)
+                      and len(events["events"]) <= 200, "telemetry_events_shape")
+              rows = []
+              for event in events["events"]:
+                  require(isinstance(event, dict), "telemetry_event_shape")
+                  facts = event.get("$workers")
+                  require(isinstance(facts, dict) and facts.get("scriptName") == WORKER, "telemetry_script_scope")
+                  timestamp = event.get("timestamp")
+                  require(type(timestamp) in (int, float) and QUERY["timeframe"]["from"] <= timestamp
+                          <= QUERY["timeframe"]["to"], "telemetry_time_scope")
+                  row = {"scriptName": WORKER, "timestamp": timestamp}
+                  version = facts.get("scriptVersion")
+                  if version is not None:
+                      require(isinstance(version, dict), "telemetry_version_shape")
+                      if version.get("id") is not None:
+                          row["scriptVersion"] = {"id": safe_identifier(version["id"],
+                              r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", "telemetry_version_id")}
+                  for name, pattern in (("requestId", r"[0-9a-fA-F-]{16,64}"), ("durableObjectId", r"[0-9a-f]{64}")):
+                      if facts.get(name) is not None:
+                          row[name] = safe_identifier(facts[name], pattern, "telemetry_identifier")
+                  if facts.get("outcome") is not None:
+                      allowed = {"ok", "exception", "canceled", "exceededCpu", "exceededMemory",
+                                 "memoryLimitExceeded", "cpuLimitExceeded", "unknown"}
+                      row["outcome"] = facts["outcome"] if facts["outcome"] in allowed else "other"
+                  if row not in rows:
+                      rows.append(row)
+              return {"status": "observed", "returned_events": len(events["events"]),
+                      "at_limit": len(events["events"]) == 200, "invocations": rows}
+
+
           def main():
-              attempted = False
-              confirmed = False
-              expected_hash = None
+              output = {"status": "refused", "read_only": True, "patch_attempts": 0, "telemetry_queries": 0}
               try:
                   api = Cloudflare(context())
-                  before = snapshot(api)
-                  desired, patch, original_limit = proposal(before["settings"])
-                  # Read the same live identity and full settings immediately before
-                  # writing. The workflow concurrency group serializes repo deploys;
-                  # Cloudflare does not provide a conditional settings PATCH here.
-                  require(snapshot(api) == before, "prewrite_changed")
-                  if comparable_settings(desired) == comparable_settings(before["settings"]):
-                      print(json.dumps({"status": "already_present", "patch_attempts": 0,
-                                        "owner_limit": original_limit}))
-                      return 0
-                  expected_hash = hashlib.sha256(json.dumps(comparable_settings(desired), sort_keys=True,
-                      separators=(",", ":"), allow_nan=False).encode()).hexdigest()
-                  attempted = True
-                  try:
-                      api.request("PATCH", "/settings", patch)
-                      confirmed = True
-                  except Refusal:
-                      pass  # Ambiguous response: observe only. Never retry the PATCH.
-                  after = snapshot(api)
-                  require(comparable_settings(after["settings"]) == comparable_settings(desired),
-                          "postwrite_settings_mismatch")
-                  require(after["code"] == before["code"] and after["runtime"] == before["runtime"],
-                          "postwrite_code_mismatch")
-                  print(json.dumps({"status": "applied_readback_verified", "patch_attempts": 1,
-                                    "patch_response_confirmed": confirmed, "owner_limit": 20,
-                                    "original_owner_limit": original_limit, "code_unchanged": True,
-                                    "conditional_restore_target": 10, "restore_requires_review": True,
-                                    "expected_settings_sha256": expected_hash,
-                                    "before_version": before["version"], "after_version": after["version"]}))
+                  output.update(settings_observation(api.request("GET", SETTINGS)))
+                  fleet = output["fleet_binding"]
+                  namespace = namespace_observation(api.request("GET", NAMESPACES), fleet)
+                  output["fleet_namespace"] = namespace
+                  require(namespace["script"] == WORKER and namespace["class"] == "FleetDurableObject"
+                          and fleet["class_name"] == namespace["class"]
+                          and fleet.get("script_name", WORKER) == WORKER
+                        and all(fleet.get(name) in (None, "") for name in ("environment", "dispatch_namespace")),
+                        "fleet_route_mismatch")
+                  output["telemetry_queries"] = 1
+                  output["telemetry"] = telemetry_observation(api.request("POST", TELEMETRY, QUERY))
+                  output["status"] = "serving_route_observed"
+                  raw = json.dumps(output, allow_nan=False)
+                  require(len(raw.encode()) <= 65536, "output_limit")
+                  print(raw)
                   return 0
               except Exception as exc:
-                  print(json.dumps({"status": "requires_reconciliation" if attempted else "refused",
-                                    "reason": str(exc) if isinstance(exc, Refusal) else "unexpected_shape",
-                                    "patch_attempts": int(attempted),
-                                    "patch_response_confirmed": confirmed,
-                                    **({"expected_settings_sha256": expected_hash} if attempted else {})}))
+                  output.pop("telemetry", None)
+                  output["reason"] = str(exc) if isinstance(exc, Refusal) else "unexpected_shape"
+                  print(json.dumps(output, allow_nan=False))
                   return 1
+
 
           if __name__ == "__main__":
               sys.exit(main())
