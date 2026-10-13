@@ -1737,9 +1737,11 @@ func baseConfig() Config {
 }
 
 type ServeConfig struct {
-	SSHPort  int    `yaml:"sshPort,omitempty"`
-	Machine  string `yaml:"machine,omitempty"`
-	Fallback string `yaml:"fallback,omitempty"`
+	AdvertiseAddresses []string `yaml:"advertiseAddresses,omitempty"`
+	NoLANCandidates    bool     `yaml:"noLANCandidates,omitempty"`
+	SSHPort            int      `yaml:"sshPort,omitempty"`
+	Machine            string   `yaml:"machine,omitempty"`
+	Fallback           string   `yaml:"fallback,omitempty"`
 }
 
 type fileConfig struct {
@@ -3933,6 +3935,17 @@ func applyNonNegativeLeaseDuration(target *time.Duration, value string) bool {
 }
 
 func applyEnv(cfg *Config) error {
+	if value, ok := os.LookupEnv("CRABBOX_SERVE_ADVERTISE_ADDRESSES"); ok {
+		cfg.Serve.AdvertiseAddresses = strings.Split(value, ",")
+	}
+	if value, ok := os.LookupEnv("CRABBOX_SERVE_NO_LAN_CANDIDATES"); ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("CRABBOX_SERVE_NO_LAN_CANDIDATES must be a boolean")
+		}
+		cfg.Serve.NoLANCandidates = parsed
+	}
+
 	cfg.Serve.Machine = getenv("CRABBOX_SERVE_MACHINE", cfg.Serve.Machine)
 	cfg.Serve.Fallback = getenv("CRABBOX_SERVE_FALLBACK", cfg.Serve.Fallback)
 	if v := os.Getenv("CRABBOX_SERVE_SSH_PORT"); v != "" {

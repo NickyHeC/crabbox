@@ -4,6 +4,7 @@
 
 ### Added
 
+- Serve agents advertise LAN and tailnet front-door candidates, with pinned-key LAN-first client selection and per-lease route caching.
 - Portal: show owners their donated serve machines, online status, capacity, allocated leases, and runtime details.
 
 ## 0.75.0 - 2026-10-12

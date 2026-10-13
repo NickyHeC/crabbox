@@ -555,7 +555,13 @@ export interface LeaseRecord {
   sshUser: string;
   sshPort: string;
   sshFallbackPorts?: string[];
-  sshJump?: { host: string; port: number; hostKey: string; fingerprint: string };
+  sshJump?: {
+    host: string;
+    port: number;
+    hostKey: string;
+    fingerprint: string;
+    candidates?: { host: string; port: number }[];
+  };
   sshHostKey?: string;
   providerAccessExpiresAt?: string;
   workRoot: string;

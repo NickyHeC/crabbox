@@ -33,6 +33,10 @@ export interface ServeAssignment {
   sshPublicKey: string;
   image: string;
 }
+export interface ServeAddressCandidate {
+  address: string;
+  kind: "tailnet" | "lan" | "explicit";
+}
 export interface ServeMachine {
   machineID: string;
   owner: string;
@@ -44,7 +48,12 @@ export interface ServeMachine {
   memoryMB: number;
   maxLeases: number;
   address: string;
-  frontDoor: { port: number; hostKey: string; fingerprint?: string };
+  frontDoor: {
+    port: number;
+    hostKey: string;
+    fingerprint?: string;
+    candidates?: ServeAddressCandidate[];
+  };
   runtime: string;
   runtimeVersion: string;
   agentVersion: string;
@@ -98,6 +107,51 @@ function validAddress(v: unknown): v is string {
   const octets = v.split(".").map(Number);
   return octets.every((n) => n <= 255) && octets[0] !== 0 && octets[0]! < 224;
 }
+function validCandidates(value: unknown, address: string): boolean {
+  if (value === undefined) return true; // Released 0.75.0 heartbeat.
+  if (!Array.isArray(value) || value.length < 1 || value.length > 4) return false;
+  const seen = new Set<string>();
+  return value.every((c, index) => {
+    if (
+      !c ||
+      typeof c !== "object" ||
+      typeof c.address !== "string" ||
+      !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(c.address) ||
+      seen.has(c.address) ||
+      (index === 0 && c.address !== address)
+    )
+      return false;
+    // New candidates are canonical IPv4 literals; do not admit alternate spellings.
+    const octets = c.address.split(".").map(Number);
+    if (
+      octets.some((n: number) => n > 255) ||
+      octets.join(".") !== c.address ||
+      octets.every((n: number) => n === 0) ||
+      octets[0] === 127 ||
+      (octets[0]! >= 224 && octets[0]! <= 239)
+    )
+      return false;
+    seen.add(c.address);
+    if (c.kind === "tailnet") return octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127;
+    if (c.kind === "lan")
+      return (
+        octets[0] === 10 ||
+        (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+        (octets[0] === 192 && octets[1] === 168)
+      );
+    return c.kind === "explicit";
+  });
+}
+function jumpForMachine(m: ServeMachine): NonNullable<LeaseRecord["sshJump"]> {
+  const candidates = m.frontDoor.candidates ?? [{ address: m.address, kind: "tailnet" }];
+  return {
+    host: candidates[0]!.address,
+    port: m.frontDoor.port,
+    hostKey: m.frontDoor.hostKey,
+    fingerprint: m.frontDoor.fingerprint!,
+    candidates: candidates.map((c) => ({ host: c.address, port: m.frontDoor.port })),
+  };
+}
 async function body<T>(r: Request): Promise<T> {
   const reader = r.body?.getReader();
   if (!reader) throw new ServeError("invalid_body");
@@ -141,9 +195,10 @@ function heartbeatInput(v: Heartbeat): boolean {
     integer(v.cpus, 4096) &&
     integer(v.memoryMB, 16 * 1024 * 1024) &&
     integer(v.maxLeases, maxLeases) &&
-    validAddress(v.address) &&
+    (v.frontDoor?.candidates !== undefined || validAddress(v.address)) &&
     v.frontDoor &&
     integer(v.frontDoor.port, 65535) &&
+    validCandidates(v.frontDoor.candidates, v.address) &&
     validText(v.frontDoor.hostKey, 256) &&
     /^ssh-ed25519 [A-Za-z0-9+/=]+(?: |$)/.test(v.frontDoor.hostKey) &&
     ["docker", "podman"].includes(v.runtime) &&
@@ -319,7 +374,15 @@ export class ServeCoordinator {
         throw new ServeError("serve_machine_limit", 409);
       const m: ServeMachine = {
         ...input,
-        frontDoor: { port: input.frontDoor.port, hostKey: input.frontDoor.hostKey, fingerprint },
+        frontDoor: {
+          port: input.frontDoor.port,
+          hostKey: input.frontDoor.hostKey,
+          fingerprint,
+          candidates: input.frontDoor.candidates?.map(({ address, kind }) => ({
+            address,
+            kind,
+          })) ?? [{ address: input.address, kind: "tailnet" }],
+        },
         owner: requestOwner(r),
         org: requestOrg(r, this.env),
         lastHeartbeat: now,
@@ -334,7 +397,7 @@ export class ServeCoordinator {
           const before = JSON.stringify(l);
           this.expire(l, old ?? m, now);
           if (live(l) && l.state === "active") {
-            l.sshJump = { host: m.address, ...m.frontDoor, fingerprint };
+            l.sshJump = jumpForMachine(m);
           }
           if (!live(l) && !seen.has(l.id) && !leaseProviderCleanupConfirmed(l)) {
             delete l.cleanupStartedAt;
@@ -699,7 +762,7 @@ export class ServeCoordinator {
         l.state = "active";
         l.host = l.id;
         l.sshPort = "22";
-        l.sshJump = { host: m.address, ...m.frontDoor, fingerprint: m.frontDoor.fingerprint! };
+        l.sshJump = jumpForMachine(m);
         l.sshHostKey = input["sshHostKey"];
       } else {
         l.state = "failed";

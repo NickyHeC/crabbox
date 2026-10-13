@@ -37,9 +37,10 @@ crabbox serve machines --json
 crabbox doctor --provider serve
 ```
 
-The default advertised address is a local IPv4 address in `100.64.0.0/10`,
-commonly supplied by a tailnet. Without one, specify `--advertise-address`.
-Clients must reach this address directly: SSH is not relayed by the coordinator.
+The agent advertises up to four IPv4 front-door candidates: a local tailnet
+address in `100.64.0.0/10`, followed by private LAN addresses. Clients try
+same-subnet LAN candidates first, then tailnet, then other candidates.
+SSH is not relayed by the coordinator; at least one candidate must be reachable.
 Normal sync, run, logs, results, SSH, list, status, inspect, and stop work through
 the existing brokered SSH-lease path.
 
@@ -183,9 +184,37 @@ configured image with lease-time bootstrap, and starts background re-preparation
 Allow one TCP port per donating machine: the agent's SSH front door, default
 `2222`. `--ssh-port 8443` (config `serve.sshPort`, environment
 `CRABBOX_SERVE_SSH_PORT`) changes it. The flag takes precedence; ports must be
-in 1–65535. The agent binds its advertised address and fails with an actionable
-error if that address or port is unavailable. Capacity is controlled solely by
+in 1–65535. The agent binds each advertised IPv4 address separately on that
+same port, never a wildcard address. If some binds fail, it logs the failures
+and advertises only the addresses that bound; no bound addresses is fatal.
+The agent re-detects candidates on each heartbeat and rebinds when addresses
+change, including DHCP and Wi-Fi changes. Capacity is controlled solely by
 `--max-leases` and the CPU/memory offer.
+
+Automatic LAN candidates come from up, non-loopback, broadcast-capable
+interfaces in `10/8`, `172.16/12`, or `192.168/16`. Tunnel and runtime bridge
+interfaces are excluded. `--no-lan-candidates` (config
+`serve.noLANCandidates`, environment `CRABBOX_SERVE_NO_LAN_CANDIDATES`) disables
+LAN discovery. LAN traffic is **not governed by tailnet policy**: the front door
+is reachable from the LAN and permits only the live lease's key authentication.
+Host firewall rules still apply.
+
+Repeat `--advertise-address` to replace automatic detection entirely, keeping
+up to four explicit IPv4 addresses in the given order. Configuration uses
+`serve.advertiseAddresses` (a YAML list), or comma-separated
+`CRABBOX_SERVE_ADVERTISE_ADDRESSES`. The released singular environment variable
+`CRABBOX_SERVE_ADVERTISE_ADDRESS` remains a fallback. Explicit addresses may be
+public or link-local, but never wildcard, loopback, or multicast.
+
+The client spends at most about six seconds probing candidates. It accepts an
+address only after an SSH key exchange proves possession of the pinned agent
+host key; a wrong host on a reused LAN subnet is skipped without prompting or
+learning its key. Both SSH hops retain their own pinned host key. The chosen
+route is printed as `serve route: lan 192.168.1.20:8443` (or `tailnet`/`explicit`)
+and included in run timing JSON as `sshRoute`. Private per-lease state caches the
+choice; subsequent invocations reuse it after a TCP connectivity check and
+re-probe candidates if it fails. Existing single-address agents and clients
+remain supported.
 
 For example, a tailnet grant can allow clients to reach only that front door:
 

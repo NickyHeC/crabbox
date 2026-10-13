@@ -30,10 +30,12 @@ import (
 // SSHJump describes an authenticated SSH transport hop; the destination still
 // has its own end-to-end SSH host key and authentication.
 type SSHJump struct {
-	Host        string `json:"host"`
-	Port        int    `json:"port"`
-	HostKey     string `json:"hostKey"`
-	Fingerprint string `json:"fingerprint,omitempty"`
+	Candidates   []SSHJumpCandidate `json:"candidates,omitempty"`
+	HostKeyAlias string             `json:"-"`
+	Host         string             `json:"host"`
+	Port         int                `json:"port"`
+	HostKey      string             `json:"hostKey"`
+	Fingerprint  string             `json:"fingerprint,omitempty"`
 }
 
 type SSHTarget struct {
