@@ -212,7 +212,7 @@ host key; a wrong host on a reused LAN subnet is skipped without prompting or
 learning its key. Both SSH hops retain their own pinned host key. The chosen
 route is printed as `serve route: lan 192.168.1.20:8443` (or `tailnet`/`explicit`)
 and included in run timing JSON as `sshRoute`. Private per-lease state caches the
-choice; subsequent invocations reuse it after a TCP connectivity check and
+choice; subsequent invocations validate only that endpoint's pinned key and
 re-probe candidates if it fails. Existing single-address agents and clients
 remain supported.
 

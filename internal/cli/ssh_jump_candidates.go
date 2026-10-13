@@ -100,29 +100,26 @@ func probeJumpCandidate(ctx context.Context, candidate SSHJumpCandidate, key ssh
 	})
 	return errors.Is(err, errJumpKeyMatched)
 }
-func cachedJumpConnects(ctx context.Context, c SSHJumpCandidate) bool {
-	ctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
-	defer cancel()
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp4", net.JoinHostPort(c.Host, strconv.Itoa(c.Port)))
-	if err != nil {
-		return false
-	}
-	_ = conn.Close()
-	return true
-}
-
-func chooseJumpCandidate(ctx context.Context, candidates []SSHJumpCandidate, key ssh.PublicKey, cached *sshJumpRoute, subnets []*net.IPNet, connects func(context.Context, SSHJumpCandidate) bool, probe func(context.Context, SSHJumpCandidate, ssh.PublicKey) bool) (sshJumpRoute, error) {
+func chooseJumpCandidate(ctx context.Context, candidates []SSHJumpCandidate, key ssh.PublicKey, cached *sshJumpRoute, subnets []*net.IPNet, probe func(context.Context, SSHJumpCandidate, ssh.PublicKey) bool) (sshJumpRoute, error) {
 	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
 	fingerprint := ssh.FingerprintSHA256(key)
+	var checked *SSHJumpCandidate
 	if cached != nil && cached.Fingerprint == fingerprint {
 		for _, candidate := range candidates {
-			if candidate == cached.SSHJumpCandidate && connects(ctx, candidate) {
-				return *cached, nil
+			if candidate == cached.SSHJumpCandidate {
+				checked = &candidate
+				if probe(ctx, candidate, key) {
+					return *cached, nil
+				}
+				break
 			}
 		}
 	}
 	for _, candidate := range orderJumpCandidates(candidates, subnets) {
+		if checked != nil && candidate == *checked {
+			continue
+		}
 		if ctx.Err() != nil {
 			break
 		}
@@ -154,7 +151,7 @@ func selectSSHJumpCandidate(target *SSHTarget, key ssh.PublicKey) error {
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &cached)
 	}
-	route, err := chooseJumpCandidate(context.Background(), jump.Candidates, key, cached, localJumpSubnets(), cachedJumpConnects, probeJumpCandidate)
+	route, err := chooseJumpCandidate(context.Background(), jump.Candidates, key, cached, localJumpSubnets(), probeJumpCandidate)
 	if err != nil {
 		return err
 	}

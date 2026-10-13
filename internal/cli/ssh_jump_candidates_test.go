@@ -76,12 +76,17 @@ func TestSSHJumpCandidatePinnedProbe(t *testing.T) {
 	good, calls := jumpProbeServer(t, goodKey, false)
 	unused, unusedCalls := jumpProbeServer(t, goodKey, false)
 	start := time.Now()
-	route, err := chooseJumpCandidate(t.Context(), []SSHJumpCandidate{wrong, stalled, good, unused}, goodKey.PublicKey(), nil, nil, cachedJumpConnects, probeJumpCandidate)
+	route, err := chooseJumpCandidate(t.Context(), []SSHJumpCandidate{wrong, stalled, good, unused}, goodKey.PublicKey(), nil, nil, probeJumpCandidate)
 	if err != nil || route.SSHJumpCandidate != good || calls.Load() != 1 || unusedCalls.Load() != 0 {
 		t.Fatalf("%+v %v calls=%d unused=%d", route, err, calls.Load(), unusedCalls.Load())
 	}
 	if time.Since(start) > 6*time.Second {
 		t.Fatal("probe budget exceeded")
+	}
+	cached := &sshJumpRoute{wrong, ssh.FingerprintSHA256(goodKey.PublicKey()), "lan"}
+	route, err = chooseJumpCandidate(t.Context(), []SSHJumpCandidate{wrong, good}, goodKey.PublicKey(), cached, nil, probeJumpCandidate)
+	if err != nil || route.SSHJumpCandidate != good {
+		t.Fatalf("wrong-key cached host prevented fallback: %+v %v", route, err)
 	}
 }
 func TestSSHJumpCandidateCacheAndReconnect(t *testing.T) {
@@ -91,17 +96,21 @@ func TestSSHJumpCandidateCacheAndReconnect(t *testing.T) {
 	cached := &sshJumpRoute{first, ssh.FingerprintSHA256(key), "lan"}
 	var probes int
 	probe := func(context.Context, SSHJumpCandidate, ssh.PublicKey) bool { probes++; return true }
-	route, err := chooseJumpCandidate(t.Context(), []SSHJumpCandidate{first, second}, key, cached, nil, func(context.Context, SSHJumpCandidate) bool { return true }, probe)
-	if err != nil || route.Host != first.Host || probes != 0 {
+	route, err := chooseJumpCandidate(t.Context(), []SSHJumpCandidate{first, second}, key, cached, nil, probe)
+	if err != nil || route.Host != first.Host || probes != 1 {
 		t.Fatalf("cache: %v %v %d", route, err, probes)
 	}
-	route, err = chooseJumpCandidate(t.Context(), []SSHJumpCandidate{first, second}, key, cached, nil, func(context.Context, SSHJumpCandidate) bool { return false }, probe)
-	if err != nil || route.Host != second.Host || probes != 1 {
+	probes = 0
+	route, err = chooseJumpCandidate(t.Context(), []SSHJumpCandidate{first, second}, key, cached, nil, func(_ context.Context, candidate SSHJumpCandidate, _ ssh.PublicKey) bool {
+		probes++
+		return candidate == second
+	})
+	if err != nil || route.Host != second.Host || probes != 2 {
 		t.Fatalf("retry: %v %v %d", route, err, probes)
 	}
 	cached.Fingerprint = "wrong"
 	probes = 0
-	_, err = chooseJumpCandidate(t.Context(), []SSHJumpCandidate{first, second}, key, cached, nil, func(context.Context, SSHJumpCandidate) bool { t.Fatal("used stale key cache"); return true }, probe)
+	_, err = chooseJumpCandidate(t.Context(), []SSHJumpCandidate{first, second}, key, cached, nil, probe)
 	if err != nil || probes != 1 {
 		t.Fatal(err, probes)
 	}
@@ -114,7 +123,7 @@ func TestSSHJumpCandidateProbeCancellation(t *testing.T) {
 	if probeJumpCandidate(ctx, stalled, signer.PublicKey()) {
 		t.Fatal("accepted stalled server")
 	}
-	if cachedJumpConnects(ctx, SSHJumpCandidate{"127.0.0.1", 0}) {
+	if probeJumpCandidate(ctx, SSHJumpCandidate{"127.0.0.1", 0}, signer.PublicKey()) {
 		t.Fatal("connected invalid port " + strconv.Itoa(0))
 	}
 }
