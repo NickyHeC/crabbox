@@ -4,6 +4,7 @@
 
 ### Changed
 
+- CLI: add per-run `--no-runtime-extension` to preserve custody heartbeats without requesting command-time lease extensions; delegated execution rejects the option when the client cannot enforce it.
 - Coordinator: remove per-owner lease lifetime overrides from the production configuration; every owner uses the global lease policy, and the deploy guard now protects the complete live override document generically. [PR 2830](https://github.com/openclaw/crabbox/pull/2830).
 
 ### Fixed
