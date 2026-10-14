@@ -7,7 +7,7 @@ Read this when you are:
 - interpreting `crabbox usage` output.
 
 The coordinator tracks lease counts, active leases,
-elapsed runtime, estimated elapsed cost, and reserved worst-case cost. This is an
+elapsed runtime, estimated elapsed cost, reserved worst-case cost, and committed budget cost. This is an
 operational guardrail, not invoice reconciliation. Provider extras such as static IP
 charges, egress, snapshots, taxes, credits, and discounts are not modeled.
 
@@ -17,12 +17,14 @@ accounted for.
 
 ## Reading `crabbox usage`
 
-For a self-owner admission snapshot across all months and organizations, use
-[`crabbox capacity`](../commands/capacity.md). It reports only resolved owner,
-existing admission count, effective owner limit, and observation time. It does
-not add a candidate lease or expose capacity-admin membership. A successful
-snapshot is not a reservation or approval to allocate: fleet, org, budget, and
-provider gates may still reject. Monthly usage below keeps its existing scope.
+For an active-lease admission snapshot across all months, use
+[`crabbox capacity`](../commands/capacity.md). It reports fleet, authenticated org,
+and owner counts and limits, observation time, and whether one additional lease
+fits those caps. Owner counts span organizations. Fleet or org exhaustion caused
+by other owners is reported as an aggregate count only, without their identities
+or lease IDs. The snapshot does not expose capacity-admin membership and is not
+a reservation or approval to allocate: counts can change, and budget or provider
+gates may still reject. Monthly usage below keeps its existing scope.
 
 `crabbox usage` requires a configured coordinator and prints the current month by default.
 
@@ -47,10 +49,10 @@ server type (sorted by reserved cost), followed by the active limits:
 
 ```text
 usage month=2026-05 scope=all
-total leases=12 active=2 runtime=18h32m estimated=$24.18 reserved=$61.40
+total leases=12 active=2 runtime=18h32m estimated=$24.18 reserved=$61.40 committed=$32.18
 providers:
-  aws                      leases=4   active=1   runtime=6h2m     estimated=$12.40   reserved=$36.00
-  hetzner                  leases=8   active=1   runtime=12h30m    estimated=$11.78   reserved=$25.40
+  aws                      leases=4   active=1   runtime=6h2m     estimated=$12.40   reserved=$36.00 committed=$18.40
+  hetzner                  leases=8   active=1   runtime=12h30m    estimated=$11.78   reserved=$25.40 committed=$13.78
 limits:
   active leases: fleet=10 user=off org=off
   monthly usd:   fleet=$500.00 user=off org=off
@@ -64,12 +66,34 @@ ignored. Admin callers may use any scope and filter by an arbitrary owner or org
 
 ## Cost model
 
-Two cost figures are tracked per lease:
+Three cost figures are reported per lease:
 
 - **`estimatedUSD`** — elapsed cost: `runtime_hours x estimatedHourlyUSD`. For active
-  leases, runtime is measured to "now"; otherwise to the lease end/release time.
+  leases, runtime is measured to "now"; otherwise to the persisted end/release time
+  or last observation for legacy terminal rows. Late release and cleanup preserve
+  that boundary. Confirmed never-allocated leases have zero compute runtime.
 - **`reservedUSD`** — worst-case cost reserved up front: `ttl_hours x hourlyUSD`, captured
-  before provisioning. Budget enforcement uses reserved cost, not elapsed cost.
+  before provisioning. This historical worst-case figure stays unchanged after the lease finishes.
+- **`committedUSD`** — the amount used by monthly budget enforcement: the full
+  reservation while a lease is active, provisioning, or retained with compute still
+  running; once finished, elapsed billable runtime multiplied by its recorded
+  `estimatedHourlyUSD`, capped at `reservedUSD`. A finished lease that never
+  provisioned a resource contributes zero. Recorded compute intervals account for
+  retained machines that stop and resume; otherwise runtime uses the existing
+  creation and end/release timestamps.
+
+The read-only lease audit cannot reconstruct an earlier deletion time that was not
+persisted. Confirmed stop/resume intervals remain authoritative.
+
+Settlement is computed from existing lease records on read, including older finished
+leases; no backfill is required. Release, expiry, deletion, reclamation, and provisioning
+failure all follow the same rule. A missed heartbeat alone does not settle a live lease. Retained resources without
+a lifetime policy also keep their reservation until a recorded stop or provider cleanup
+confirms that compute has ended. Failed or canceled provisioning with an unresolved
+provider resource likewise keeps its reservation until cleanup confirms completion.
+The additive `committedUSD` field appears in JSON totals and every breakdown. Current
+CLIs append `committed=$...` in text output; older CLIs ignore the new field, and newer
+CLIs still accept coordinators that omit it.
 
 Pricing precedence (highest first):
 
@@ -101,11 +125,25 @@ resolution or authority RPCs remain with their existing owners.
 ## Budget guardrails
 
 Budgets are enforced on lease creation. Exceeding any active-lease limit or monthly
-reserved-USD budget rejects the request with HTTP 429 (`cost_limit_exceeded`). All
+committed-USD budget rejects the request with HTTP 429 (`cost_limit_exceeded`). All
 budgets default to `off` when their environment variable is unset or non-positive.
 Active limits keep counting a live managed lease after its heartbeat deadline until
 cleanup commits a terminal state, because its provider resource may still exist. The
 usage summary's active count uses the same definition.
+
+The deployed and preview coordinator configuration sets the fleet-wide, per-org,
+and capacity-admin active-lease caps to 50. The ordinary per-owner cap is 10.
+Monthly committed-USD budgets are $100,000 fleet-wide, $50,000 per owner, and
+$100,000 per org.
+
+Active-lease checks run in fleet → owner → org order, before monthly budgets.
+The capacity response's `admissible` and `blockedBy` use that same order, with
+`blockedBy: null` when all three caps have headroom. New fleet/org limit fields
+use `null` for unlimited; the existing owner `effectiveLimit` retains numeric `0`.
+An allocation refused by the fleet cap says `fleet active lease limit exceeded`;
+owner and org refusals say `active lease limit for owner exceeded` and
+`active lease limit for org exceeded`. Allocation errors include the candidate
+lease in their count; capacity reports existing leases only.
 
 ```text
 CRABBOX_MAX_ACTIVE_LEASES            fleet-wide active lease cap
@@ -113,18 +151,39 @@ CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER  per-owner active lease cap
 CRABBOX_MAX_ACTIVE_LEASES_PER_ORG    per-org active lease cap
 CRABBOX_CAPACITY_ADMIN_OWNERS        comma-separated owners with an elevated active lease cap;
                                       use github:<numeric-id> for GitHub users
+CRABBOX_DEPLOYMENT_CAPACITY_ADMIN_OWNERS
+                                      additional capacity admins managed in deployment config
+CRABBOX_SHARED_CAPACITY_OVERRIDE_OWNERS
+                                      capacity admins exempt from fleet and org active caps
 CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN
                                       per-owner active lease cap for capacity admins
-CRABBOX_MAX_MONTHLY_USD              fleet-wide monthly reserved-USD budget
-CRABBOX_MAX_MONTHLY_USD_PER_OWNER    per-owner monthly reserved-USD budget
-CRABBOX_MAX_MONTHLY_USD_PER_ORG      per-org monthly reserved-USD budget
+CRABBOX_MAX_MONTHLY_USD              fleet-wide monthly committed-USD budget
+CRABBOX_MAX_MONTHLY_USD_PER_OWNER    per-owner monthly committed-USD budget
+CRABBOX_MAX_MONTHLY_USD_PER_ORG      per-org monthly committed-USD budget
 CRABBOX_DEFAULT_ORG                  org assigned when no org header is present
 ```
 
+Capacity membership combines both owner lists case-insensitively. Deployment
+configuration can add members without replacing a secret-backed owner list.
+Capacity membership does not grant administrative API access.
+
+A member of `CRABBOX_SHARED_CAPACITY_OVERRIDE_OWNERS` bypasses fleet and org
+active-lease caps only when that owner also belongs to the combined capacity-admin
+list and the admin owner limit is positive. Membership uses the same case-insensitive
+normalization. This explicit override leaves the owner cap, all monthly budgets,
+authentication, and usage accounting unchanged. Other capacity admins still share
+the fleet and org caps. Production enables this override for its configured deployment
+admin; preview does not enable it. Capacity reports the caller's effective shared
+limits as `null` while retaining the real aggregate counts.
+
 Monthly budget checks add the candidate lease's `reservedUSD` to the month's existing
-reserved total for the relevant scope. Live managed leases keep reserving budget after
-a UTC month rollover until cleanup commits a terminal state. A lease that would push
-the scope over budget is refused before it provisions.
+`committedUSD` for the relevant fleet, owner, or org scope. Live managed leases keep
+reserving budget after a UTC month rollover until they finish. Finished leases are
+attributed to their creation month, as before. Usage reports retain their selected-month
+filter, so live leases created in an earlier month additionally count toward admission
+but do not appear in the current month's report. A lease that would push the scope over
+budget is refused before it provisions. Active-lease checks still run first; monthly
+checks still run in fleet → owner → org order.
 
 ## Identity for usage accounting
 

@@ -611,8 +611,11 @@ scripts/verify-homebrew-release.sh \
 ```
 
 The six-argument verifier first fetches the immutable public release by numeric
-ID without authentication and compares its exact notes, inventory, asset IDs,
-sizes, and digests with the supplied bytes. Protected static `verify-release.sh`
+ID without authentication, or reads the JSON file supplied through
+`CRABBOX_HOMEBREW_RELEASE_METADATA`, and compares its exact notes, inventory,
+asset IDs, sizes, and digests with the supplied bytes. Supplied metadata must
+still describe the requested immutable public release; it does not bypass any
+validation. Protected static `verify-release.sh`
 validation precedes Homebrew. There is no public verifier run ID, proof ZIP,
 witness, or post-candidate API comparison.
 
@@ -635,7 +638,11 @@ verifier, before and after installation.
 The hosted `Verify Homebrew Release` workflow (`verify-homebrew.yml`) accepts
 `tag`, `tag_object`, `source_commit`, `verifier_commit`, and `release_id`. It uses
 protected-default tooling and anonymous fixed-repository downloads on both
-native architectures, then runs the same six-argument verifier. It never writes
+native architectures. A separate metadata step uses the workflow's read-only
+`GITHUB_TOKEN` to avoid shared-runner anonymous GitHub API rate limits, then
+passes only the response JSON to the same six-argument verifier. The token is
+scoped to that step; Homebrew and candidate execution remain credential-free.
+The workflow keeps `contents: read` permissions and never writes
 to the tap or supplies candidate-accessible credentials. Rerun this installation
 smoke independently after a smoke failure; do not re-enter publication.
 
@@ -668,6 +675,24 @@ follows symlinks or changes file permissions, and an earlier verification failur
 keeps its original exit status even if cleanup also fails.
 
 ### 2. Verify the draft natively
+
+Online notarization runs only when the binary architecture matches the native
+host; foreign binaries still receive every static signature, requirement,
+identity, and entitlement check. Both native hosts are required for complete
+draft, public-release, and Homebrew verification, including the arm64 helper,
+embedded VMD, and both companion runtimes from the amd64 archive. A local script
+invocation or draft-creation precheck covers only its host's online checks; the
+dual-host workflow supplies the complete gate. For local/manual diagnostics,
+set `CRABBOX_VERIFY_FOREIGN_ONLINE_NOTARIZATION=1` when invoking
+`scripts/verify-macos-binary.sh` to force the foreign online check (default `0`).
+
+A fresh macOS host can transiently fail its first online notarization lookup.
+The verifier retries the identical strict check at most twice, after 5 and 15
+seconds, only for exit 3 with an attributed notarization-daemon error code 3 and
+complete diagnostics without a conflicting classified failure. Each failed
+attempt and the final verdict remain visible. Signature, identity, designated
+requirement, revoked-hash, missing-ticket, other daemon errors, unknown failures,
+and interrupted checks are never retried; rejected binaries are never executed.
 
 Dispatch the protected-default verifier with the tag, tag-object ID, source
 commit, numeric draft ID, and protected workflow commit. Both native static and

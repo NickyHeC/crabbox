@@ -87,13 +87,35 @@ gcp:
   tags:
     - crabbox-ssh
   sshCIDRs: []
-  rootGB: 400
+  rootGB: 0 # automatic: class default, at least the image minimum
   serviceAccount: ""
 ```
 
 Defaults applied when a field is unset: `zone` `europe-west2-a`, `network`
-`default`, `tags` `[crabbox-ssh]`, `rootGB` `400`, and the Ubuntu 26.04 LTS image
+`default`, `tags` `[crabbox-ssh]`, automatic root sizing, and the Ubuntu 26.04 LTS image
 above. `project` and `zone` are required for a direct lease.
+
+Automatic boot disks are 40 GB for `tiny`, 80 GB for `small`, 150 GB for
+`standard` and `fast`, 250 GB for `large`, and 400 GB for `beast`. Unset or zero
+`gcp.rootGB` selects this policy. Direct and brokered creates read the source
+image's disk size and raise the automatic default when necessary. Family aliases
+are resolved to the exact inspected image. Project-relative references such as
+`global/images/my-image` resolve in the selected project. Brokered disk-snapshot restores use
+the same policy with the snapshot's size as the minimum. Provider credentials
+need image read access (and snapshot read access for snapshot restores).
+
+Set `gcp.rootGB: 400` or `CRABBOX_GCP_ROOT_GB=400` to
+retain 400 GB. Positive explicit sizes are forwarded unchanged, including sizes
+that GCP rejects as smaller than the source. The coordinator's
+`CRABBOX_GCP_ROOT_GB` remains an explicit operator override when the request
+leaves sizing unset. Config output reports `rootGB: 0` for automatic sizing;
+the source minimum is resolved only during create. Upgrade the coordinator as
+well as the client for class sizing in brokered mode.
+
+Ready-pool borrows retain their existing disk; new members follow this policy.
+Machine-image restores preserve their inherited disk sizes and types: GCP
+[does not allow attached-disk property overrides during restore](https://cloud.google.com/compute/docs/machine-images/create-instance-from-machine-image#create-instance-from-image-override).
+Use disk-snapshot checkpoints when a fork needs a different root size.
 
 Project resolution order is `CRABBOX_GCP_PROJECT`, then `gcp.project`, then
 `GOOGLE_CLOUD_PROJECT`, then `GCP_PROJECT_ID`. Brokered requests forward only the
@@ -444,13 +466,14 @@ Three independent safety nets enforce expiry:
 
 - Direct GCP VMs set Compute Engine `maxRunDuration` with termination action
   `DELETE`, so the TTL hard cap is enforced by the platform.
-- Each VM installs a guest-side `crabbox-gcp-expiry-guard` systemd timer that
-  reads live instance labels through the metadata service and Compute API, then
-  self-deletes expired leases, including kept warmups, when the attached service
-  account can delete the VM. New VMs receive this behavior; existing VMs retain
-  their installed guard and must be recreated to receive the updated idle reaper.
-  Manual `crabbox cleanup` continues to skip kept leases; use explicit `stop`
-  to remove an existing kept VM.
+- New direct Linux VMs install the shared `crabbox-expiry-guard` systemd timer.
+  It reads live instance labels through the metadata service and Compute API,
+  then self-deletes expired leases, including kept warmups, when the attached
+  service account can delete the VM. The timer runs every two minutes; running
+  and provisioning states have a one-hour expiry grace. Existing VMs retain
+  their installed guard and must be recreated to receive this version.
+  Manual `crabbox cleanup` also expires kept leases. Brokered leases do not
+  install this guard; their coordinator owns expiry.
 - Cleanup removes stale local GCP claim files whose lease IDs no longer appear in
   provider inventory.
 
@@ -470,8 +493,8 @@ drift before persisting evidence.
 
 This observation runs only for typed `identity` and `register-identity`
 requests after lease access, state, expiry, and request metadata validation.
-Ordinary launches, legacy ready pools, borrow/return/heartbeat, and reconciliation
-do not read image or snapshot metadata. The coordinator credentials need
+Ordinary launches with automatic root sizing read image or snapshot size metadata.
+Borrow/return/heartbeat and reconciliation do not read source metadata. The coordinator credentials need
 `compute.instances.get` and `compute.disks.get` for typed GCP identity
 operations.
 
@@ -599,6 +622,22 @@ This reduces the observation delay for an early address, not the VM's boot time.
 
 ## Coordinator preparation reuse
 
+For automatic root sizing, the coordinator caches the resolved image or snapshot
+path and minimum disk size for up to 30 minutes from lookup start. The cache is
+memory-only, bounded to 128 references, and isolated by coordinator environment,
+credential generation, execution project, and source project/reference. Zones and
+machine classes share source metadata, but each create still applies its class
+default. Family aliases stay pinned to the inspected image during that window;
+new family members appear on the next uncached lookup. Cache hits do not extend
+the window. Cold coordinators and credential rotation require fresh metadata.
+
+Image, snapshot, disk, and not-found provider errors discard these hints, including
+asynchronous operation errors; failed lookups are never cached. In-flight reads
+cannot refill invalidated entries. Explicit request or operator root sizes skip
+the lookup entirely, as do machine-image restores. Ownership and cleanup never
+use this cache. `gcp.image_minimum` measures an uncached lookup, including source
+metadata validation and any token acquisition; warm cache hits emit no lookup step.
+
 The coordinator caches an exact firewall verification in memory for up to five
 minutes, scoped to its environment, credential generation, project, firewall
 name, network, and desired policy. Creates with the same policy during that
@@ -612,7 +651,8 @@ state, source CIDRs, target tags, and TCP ports, with no additional selectors or
 deny rules. Updates and inserts require a subsequent exact GET before reuse.
 Changed policies and credentials require fresh verification. GCP request errors
 (including authentication, missing resources, transport, and malformed responses),
-operation errors, and address-readiness timeouts discard cached verifications;
+operation errors, root-image or snapshot metadata request failures (including
+cross-project lookups), and address-readiness timeouts discard cached verifications;
 an in-flight older read cannot refill an invalidated entry.
 
 This introduces a bounded drift window: external firewall edits or deletion can

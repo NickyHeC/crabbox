@@ -16,6 +16,7 @@ import {
 import { base64URL } from "./encoding";
 import { ExpiringTokenCache, type ExpiringToken } from "./expiring-token-cache";
 import type { GCPFirewallCache } from "./gcp-firewall-cache";
+import type { GCPImageMinimumCache, GCPImageMinimum } from "./gcp-image-minimum-cache";
 import { redactDiagnosticSecrets } from "./http";
 import {
   leaseProviderLabels,
@@ -30,6 +31,7 @@ import {
   type ProviderProvisioningCleanupClaim,
 } from "./provider-provisioning";
 import { ProvisioningAttemptHistory } from "./provisioning-attempts";
+import { defaultRootGB } from "./root-disk";
 import { leaseProviderName } from "./slug";
 import type {
   CreationEvent,
@@ -220,6 +222,7 @@ export class GCPClient {
     project?: string,
     private readonly sharedTokenCache?: ExpiringTokenCache,
     private readonly firewallCache?: GCPFirewallCache,
+    private readonly imageMinimumCache?: GCPImageMinimumCache,
   ) {
     this.tokenCache = sharedTokenCache ?? new ExpiringTokenCache();
     this.project =
@@ -234,7 +237,7 @@ export class GCPClient {
       "CRABBOX_GCP_SSH_CIDRS",
     );
     if (this.sshCIDRs.length === 0) this.sshCIDRs.push("0.0.0.0/0");
-    this.rootGB = numberFromEnv(env.CRABBOX_GCP_ROOT_GB, 400);
+    this.rootGB = numberFromEnv(env.CRABBOX_GCP_ROOT_GB, 0);
     this.serviceAccount = env.CRABBOX_GCP_SERVICE_ACCOUNT?.trim() || "";
     if (!this.project) throw new Error("GCP_PROJECT_ID or CRABBOX_GCP_PROJECT secret is required");
     if (hasPartialServiceAccountCredential(env)) {
@@ -278,6 +281,7 @@ export class GCPClient {
       scopedProject,
       this.sharedTokenCache,
       this.firewallCache,
+      this.imageMinimumCache,
     );
     client.fetcher = this.fetcher;
     client.tokenCache = this.sharedTokenCache ?? this.tokenCache.clone();
@@ -666,6 +670,7 @@ export class GCPClient {
       ],
     };
     if (!config.gcpMachineImage) {
+      const explicitRootGB = config.gcpRootGB || this.rootGB;
       const initializeParams: Record<string, unknown> = config.gcpSnapshot
         ? { sourceSnapshot: gcpSnapshotRef(config.gcpSnapshot, project) }
         : {
@@ -673,10 +678,16 @@ export class GCPClient {
               "gcp.image_selection",
               () => config.gcpImage || this.image,
             ),
-            diskSizeGb: config.gcpRootGB || this.rootGB,
           };
-      if (config.gcpSnapshot && config.gcpRootGB > 0) {
-        initializeParams["diskSizeGb"] = config.gcpRootGB;
+      if (explicitRootGB > 0) {
+        initializeParams["diskSizeGb"] = explicitRootGB;
+      } else {
+        const sourceKey = config.gcpSnapshot ? "sourceSnapshot" : "sourceImage";
+        const source = String(initializeParams[sourceKey]);
+        const image = await this.rootDiskSource(source, project);
+        initializeParams["diskSizeGb"] = Math.max(defaultRootGB(config.class), image.diskSizeGb);
+        // Family aliases must launch the exact image we inspected.
+        initializeParams[sourceKey] = image.source;
       }
       instance["disks"] = [
         {
@@ -1247,6 +1258,54 @@ export class GCPClient {
     throw conflictError;
   }
 
+  private async rootDiskSource(source: string, selectedProject: string): Promise<GCPImageMinimum> {
+    if (source.startsWith("global/")) source = `projects/${selectedProject}/${source}`;
+    const match =
+      /^(?:https:\/\/(?:compute|www)\.googleapis\.com\/compute\/v1\/)?projects\/([^/]+)\/global\/(images|snapshots)\/(?:family\/)?([^/]+)$/.exec(
+        source,
+      );
+    if (!match) throw new Error(`resolve GCP root disk minimum: invalid source ${source}`);
+    const [, project, kind, name] = match;
+    const family = source.includes("/images/family/");
+    const path = `/global/${kind}/${family ? "family/" : ""}${name}`;
+    const resolve = () =>
+      measureCreationStep("gcp.image_minimum", async () => {
+        const client = new GCPClient(
+          this.env,
+          this.zone,
+          project,
+          this.tokenCache,
+          this.firewallCache,
+          this.imageMinimumCache,
+        );
+        client.fetcher = this.fetcher;
+        const image = await client.gcp<{ name?: string; diskSizeGb?: string | number }>(
+          "GET",
+          path,
+        );
+        const minimum = Number(image.diskSizeGb);
+        if (!Number.isSafeInteger(minimum) || minimum <= 0 || !image.name) {
+          throw new Error(
+            `resolve GCP root disk minimum: source ${source} has no name or disk size`,
+          );
+        }
+        return { source: `projects/${project}/global/${kind}/${image.name}`, diskSizeGb: minimum };
+      });
+    return this.imageMinimumCache
+      ? this.imageMinimumCache.get(JSON.stringify([selectedProject, project, path]), resolve)
+      : resolve();
+  }
+
+  private invalidateImageMinimumOnError(error: unknown): void {
+    const detail = error instanceof GCPHTTPError ? error.body : errorMessage(error);
+    if (
+      (error instanceof GCPHTTPError && error.status === 404) ||
+      /image|snapshot|disk|not[\s_-]*found/i.test(detail)
+    ) {
+      this.imageMinimumCache?.invalidate();
+    }
+  }
+
   private async gcp<T>(method: string, path: string, body?: unknown): Promise<T> {
     const step = path.startsWith("/global/firewalls")
       ? method === "GET"
@@ -1267,6 +1326,7 @@ export class GCPClient {
         : this.gcpRequest<T>(method, path, token, body));
     } catch (error) {
       this.firewallCache?.invalidate();
+      this.invalidateImageMinimumOnError(error);
       throw error;
     }
   }
@@ -1471,6 +1531,7 @@ export class GCPClient {
       operationError(op);
     } catch (error) {
       this.firewallCache?.invalidate();
+      this.invalidateImageMinimumOnError(error);
       throw error;
     }
   }

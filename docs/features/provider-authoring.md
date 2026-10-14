@@ -93,6 +93,16 @@ which can import and register the real adapter without an import cycle. Use
 scoped backend injection when needed to keep execution local; do not reproduce
 the adapter's policy in a fake provider.
 
+## Configuration-gated features
+
+Keep `Spec()` conservative and free of configuration reads. A provider that
+requires an operator opt-in can implement `ProviderConfiguredFeatures` to
+supply `ConfiguredFeatures(cfg)` and validate capability-specific restrictions.
+Core uses those features for request admission, `providers --configured`,
+and direct WebVNC routing. Keep template authorization and platform policy in the
+provider; readiness must still verify the requested feature before acquisition
+succeeds. Static metadata such as `providers describe` retains the baseline spec.
+
 ## Step 3. Register The Provider
 
 A provider is a small struct that satisfies `core.Provider`:
@@ -197,6 +207,9 @@ Rules:
     `workspace-restore`, `provider-snapshot`).
   - `FeatureRunProof` — delegated backend can return bounded stream/timing
     proof metadata.
+  - `FeatureShellScriptRun` — delegated backend accepts shell scripts through
+    `--script` or `--script-stdin`, including trailing script arguments. The
+    adapter owns script execution; this does not advertise repository sync.
   - `FeatureRunSession` — exposes a provider-neutral run-session handle.
     Delegated backends may return a validated handle in `RunResult`. An
     explicitly opted-in SSH-lease provider that also advertises `FeatureSSH`
@@ -210,7 +223,7 @@ Rules:
     Crabbox MCP host.
 - `Coordinator` is `CoordinatorSupported` only when the shared coordinator
   provider adapter can provision your runners. Today that is `aws`, `azure`,
-  `daytona`, `gcp`, and `hetzner`. Everything else — all delegated run backends
+  `daytona`, `gcp`, `hetzner`, and `serve`. Everything else — all delegated run backends
   and Static SSH — sets `CoordinatorNever`. Even a `CoordinatorSupported`
   provider runs direct from the CLI unless a broker URL is configured (see
   [Coordinator](coordinator.md)).
@@ -357,6 +370,16 @@ ProviderConfigShowNormalizer and require actionable provider selection.
 
 Pick the interface that matches the kind you declared. Both embed `Backend`,
 which only requires `Spec() ProviderSpec`.
+
+For offline backend capability discovery, implement
+`ProviderBackendCapabilitySource.BackendCapabilities()` on the provider. Return
+a metadata-only backend (usually a zero-value backend pointer) whose capability
+methods are safe without runtime configuration, clients, credentials, or side
+effects. The catalog derives `fixed-lease-id` from its
+`IdempotentLeaseIDBackend.SupportsRequestedLeaseID()` result; do not duplicate
+that feature in `Spec().Features`. Coordinator-brokered SSH providers use the
+coordinator wrapper's capability. Discovery never invokes backend lifecycle
+methods or `Configure`.
 
 ### SSH Lease Backend
 
@@ -833,3 +856,38 @@ outages and guest reboot. AWS uses SSM, root-owned generation tombstones,
 persistent expiry timers, and observed boot-ID changes. Whole-instance reboot
 cannot preserve a replacement grant's sessions, so v1 has no in-place renewal.
 Unsupported adapters must leave this capability absent.
+
+### Local claim retention
+
+`ProviderSpec.ClaimExpiryBound` optionally declares a remotely enforced maximum
+lease lifetime after use. Zero (the default) disables age-only local claim
+pruning. Opt in only when expiry needs no running client and no separate
+settlement or recovery receipt. Coordinator support alone is insufficient: the
+stored claim must establish which lifecycle owns the resource. Core checks claim
+age, protected bindings, and this bound, then removes only an unchanged local
+claim under its existing operation lock. See [`claims prune`](../commands/claims.md#prune).
+
+Use the `Context` variants of claim lookup, listing, and slug allocation helpers
+when an operation has a context. The existing context-free provider extension
+APIs remain available, but cannot cancel fallback slug/resource scans.
+
+### Lifetime extension capability
+
+Brokered providers declare `runtimeExtension` in the coordinator provider
+registry. Use `false` when allocation fixes a native destruction deadline;
+creation still receives the clamped requested TTL, but explicit runtime extension
+returns 409 and auto-extension is skipped. Coordinator-owned VM lifetimes and
+served assignments that can receive revised deadlines declare `true`.
+
+Direct adapters with mutable lifecycle labels/tags implement the optional
+`LeaseExtensionBackend.ExtendLease` interface. `LeaseExtendRequest` carries the
+exact resolved lease, a new total TTL or additive duration, and an optional
+reason. `ExtendDirectLease` applies the configured ceiling and holds the local
+claim fence across the adapter's identity checks and metadata write. The adapter
+must verify the live resource in its original account/scope before changing
+`ttl_secs` and `expires_at`. Pass the backend to `ExtendDirectLease` so it can
+reuse the authenticated SSH target resolution for file-backed guest guards.
+It publishes provider metadata and the local claim before refreshing the guest,
+and retains a pending refresh on failure so the same request is retryable without
+another lifetime increase. Metadata-backed guards need no guest write. Providers
+without the capability return an explicit unsupported-provider diagnostic.

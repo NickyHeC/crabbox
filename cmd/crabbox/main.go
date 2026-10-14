@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,11 +32,21 @@ func main() {
 	}
 	if err != nil {
 		printError(os.Stderr, err)
+		printFixedAllocationResult(os.Stderr, err)
 		var exit cli.ExitError
 		if cli.AsExitError(err, &exit) {
 			os.Exit(exit.Code)
 		}
 		os.Exit(1)
+	}
+}
+
+func printFixedAllocationResult(w io.Writer, err error) {
+	var allocation *cli.FixedAllocationResult
+	if errors.As(err, &allocation) {
+		if encoded, marshalErr := json.Marshal(allocation); marshalErr == nil {
+			fmt.Fprintf(w, "crabbox-allocation-result %s\n", encoded)
+		}
 	}
 }
 
@@ -58,6 +69,12 @@ func printError(w io.Writer, err error) {
 	}
 	var printCauses func(error)
 	printCauses = func(err error) {
+		// Safe provider diagnostics may retain private typed causes for Is/As.
+		// Visit sibling failures, but never render through this display boundary.
+		if safe, ok := err.(interface{ DiagnosticMessage() string }); ok {
+			printMessage(safe.DiagnosticMessage())
+			return
+		}
 		if joined, ok := err.(interface{ Unwrap() []error }); ok {
 			causes := joined.Unwrap()
 			var exit cli.ExitError

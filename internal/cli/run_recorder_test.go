@@ -748,7 +748,17 @@ func newRunRecorderCreateHarness(t *testing.T, eventResponse *runRecorderTestRes
 	}))
 	t.Cleanup(server.Close)
 	harness.client = &CoordinatorClient{BaseURL: server.URL, Client: server.Client()}
+	disableRunAdmissionBackoff(t)
 	return harness
+}
+
+// Admission backoff timing is covered with synthetic time; real-server tests skip the sleeps.
+// Callers must not be parallel tests: this swaps a package-level hook.
+func disableRunAdmissionBackoff(t *testing.T) {
+	t.Helper()
+	previous := runAdmissionRetryDelay
+	runAdmissionRetryDelay = func(int, error) time.Duration { return 0 }
+	t.Cleanup(func() { runAdmissionRetryDelay = previous })
 }
 
 func (h *runRecorderCreateHarness) snapshot(t *testing.T) ([]map[string]any, map[string]any) {
@@ -868,8 +878,8 @@ func TestRunRecorderMarksHistoryUnavailableAfterPersistentCreateFailure(t *testi
 	rec.AttachLease(t.Context(), "cbx_abcdef123456", "blue-lobster", harness.config)
 	createBodies, _ := harness.snapshot(t)
 
-	if len(createBodies) != 4 {
-		t.Fatalf("create requests=%d want 4", len(createBodies))
+	if len(createBodies) != 2*runAdmissionAttempts {
+		t.Fatalf("create requests=%d want %d", len(createBodies), 2*runAdmissionAttempts)
 	}
 	if rec.runID != "" || !rec.historyUnavailable {
 		t.Fatalf("recorder runID=%q historyUnavailable=%v", rec.runID, rec.historyUnavailable)
@@ -893,7 +903,8 @@ func TestRunRecorderRetriesFailedLeaseCreateOnReplacementLease(t *testing.T) {
 		t,
 		&runRecorderTestResponse{status: http.StatusOK, body: `{"event":{"runID":"run_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","seq":1,"type":"lease.created","createdAt":"2026-05-02T00:00:01Z"}}`},
 		func(call int) runRecorderTestResponse {
-			if call < 5 {
+			// Both the recorder's own admission and the first lease attach exhaust their attempts.
+			if call <= 2*runAdmissionAttempts {
 				return runRecorderTestResponse{status: http.StatusServiceUnavailable, body: `{"error":"temporary_unavailable"}`}
 			}
 			return runRecorderTestResponse{status: http.StatusOK, body: `{"run":{"id":"run_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","leaseID":"cbx_replacement123","owner":"alice@example.com","org":"example-org","provider":"aws","class":"standard","serverType":"t3.small","command":["go","test"],"state":"running","phase":"starting","logBytes":0,"logTruncated":false,"startedAt":"2026-05-02T00:00:00Z"}}`}
@@ -908,13 +919,13 @@ func TestRunRecorderRetriesFailedLeaseCreateOnReplacementLease(t *testing.T) {
 	rec.AttachLease(t.Context(), "cbx_replacement123", "green-lobster", harness.config)
 	createBodies, _ := harness.snapshot(t)
 
-	if len(createBodies) != 5 {
-		t.Fatalf("create requests=%d want 5", len(createBodies))
+	if len(createBodies) != 2*runAdmissionAttempts+1 {
+		t.Fatalf("create requests=%d want %d", len(createBodies), 2*runAdmissionAttempts+1)
 	}
-	if got := createBodies[2]["leaseID"]; got != "" {
+	if got := createBodies[runAdmissionAttempts]["leaseID"]; got != "" {
 		t.Fatalf("first lease-time create leaseID=%#v", got)
 	}
-	if got := createBodies[4]["leaseID"]; got != "" {
+	if got := createBodies[2*runAdmissionAttempts]["leaseID"]; got != "" {
 		t.Fatalf("replacement create leaseID=%#v", got)
 	}
 	rec.waitForEvents(time.Second)

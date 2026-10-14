@@ -545,6 +545,9 @@ func classifyGitOrigin(remoteURL string) gitOriginDisposition {
 	if gitRemoteURLHasCredentials(raw) || strings.ContainsAny(raw, "?#") {
 		return gitOriginNonForwardable
 	}
+	// Classify the same anonymous URL that Git seeding uses. A GitHub SCP
+	// spelling must not disable its supported HTTPS seed before hydration.
+	raw = normalizeGitRemoteURL(raw)
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.Opaque != "" {
 		return gitOriginNonForwardable
@@ -580,6 +583,10 @@ func validateGitOverlayManifest(repo Repo, manifest SyncManifest) error {
 }
 
 func validateGitOverlayManifestAtState(repo Repo, manifest SyncManifest, checkout gitOverlayCheckoutState) error {
+	return validateGitSyncManifestAtState(repo, manifest, checkout, gitOverlayTransformAttributes)
+}
+
+func validateGitSyncManifestAtState(repo Repo, manifest SyncManifest, checkout gitOverlayCheckoutState, attributes []string) error {
 	if repo.Root == "" || repo.Head == "" {
 		return fmt.Errorf("missing_repo_identity")
 	}
@@ -624,7 +631,7 @@ func validateGitOverlayManifestAtState(repo Repo, manifest SyncManifest, checkou
 		{source: repo.Head, paths: splitNul(targetPaths)},
 		{paths: manifest.Files},
 	} {
-		attribute, err := gitOverlayTransformAttribute(repo.Root, inspection.source, inspection.paths)
+		attribute, err := gitSyncTransformAttribute(repo.Root, inspection.source, inspection.paths, attributes)
 		if err != nil {
 			return fmt.Errorf("git_attribute_inspection")
 		}
@@ -691,7 +698,7 @@ func validateGitOverlayCheckoutConfig(root string) error {
 	return nil
 }
 
-func gitOverlayTransformAttribute(root, source string, paths []string) (string, error) {
+func gitSyncTransformAttribute(root, source string, paths, attributes []string) (string, error) {
 	if len(paths) == 0 {
 		return "", nil
 	}
@@ -708,7 +715,7 @@ func gitOverlayTransformAttribute(root, source string, paths []string) (string, 
 		args = append(args, "--source="+source)
 	}
 	args = append(args, "-z", "--stdin")
-	args = append(args, gitOverlayTransformAttributes...)
+	args = append(args, attributes...)
 	cmd := exec.Command("git", args...)
 	cmd.Dir = root
 	cmd.Env = repositoryGitEnvironment()

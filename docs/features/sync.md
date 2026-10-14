@@ -20,6 +20,14 @@ Windows keeps native rsync/SSH pairing or privately staged WSL credentials;
 native SSH-config routes stay on the native client. Artifact and egress uploads
 use the same private SSH configuration boundary.
 
+For rsync, `sync.timeout` (default `15m`) is an I/O inactivity limit, rounded up
+to whole seconds. Transfers may take longer while protocol I/O continues, even
+without `--debug` output. Parent cancellation still stops the transfer. Manifest
+staging and archive-based sync retain their existing wall-clock limits. Manifest
+receivers on POSIX targets buffer filesystem writes while retaining exact-length
+framing with portable `dd` operands, preserving binary filenames and rejecting
+truncated frames.
+
 `--no-sync` skips local file transfer only on providers that support it.
 Blacksmith Testbox rejects it before lease access or execution because native
 Testbox runs own sync and offer no supported bypass, including when reusing an
@@ -90,6 +98,10 @@ letting you test uncommitted local edits.
 Filesystem Git origins are resolved on the runner during Git seeding and must
 be readable from that runner; otherwise Crabbox falls back to a full manifest sync.
 
+GitHub origins written as `git@github.com:owner/repo.git` use anonymous HTTPS
+for seeding, including before local Actions hydration. No local SSH credentials
+are forwarded. Other SSH origins remain ineligible for remote origin seeding.
+
 ### Explicit directory source
 
 Use `sync.source: directory` to sync an include-only working set from a directory
@@ -145,7 +157,7 @@ Git-backed ready pools, Actions hydration/owned workspaces, `sync.gitOverlay`,
 unsupported selections fail before acquisition; an existing Actions-owned
 workspace is rejected after its marker is read, before sync changes it; lookup failures stop rather than assume a raw workspace. Default
 Git seeding and fingerprinting are inapplicable, and directory runs explicitly
-use plain-manifest mode. Native Jujutsu workspaces remain unsupported.
+use plain-manifest mode. Native Jujutsu workspaces use the revision adapter below.
 
 With `--no-sync`, a valid directory selection is inactive: no include requirement,
 enumeration, or temporary Git metadata is needed. Existing provider-specific
@@ -154,19 +166,39 @@ enumeration, or temporary Git metadata is needed. Existing provider-specific
 
 ### Jujutsu workspaces
 
-Crabbox currently supports Jujutsu workspaces only when they are colocated with
-Git metadata: the workspace root must contain both `.jj` and `.git`. Native
-Jujutsu revision mapping is not supported yet. Because the sync manifest is
-Git-owned, Crabbox rejects a native `.jj` workspace before leasing or borrowing
-a runner rather than letting Git discover an outer checkout and sync the wrong
-revision. This also applies when the native workspace is nested inside an outer
-Git repository.
+Native, Git-backed Jujutsu workspaces are supported by `sync-plan` and ordinary
+SSH-lease `run` sync. Install `jj` locally (`brew install jj` on macOS). Crabbox
+asks jj to snapshot working-copy edits, resolves the full commit ID of `@`, pins
+the jj operation, and reads that commit's tree from `jj git root`. An octopus
+merge with three or more parents is handled exactly like any other revision;
+Crabbox never guesses a parent or uses a change ID as a Git commit. Files that
+jj ignores or leaves untracked are not part of `@` and are not transferred.
 
-If you are starting from an existing Git checkout and want a colocated Jujutsu
-workspace, `jj git init --git-repo=.` is one initialization example. It does not
-convert an existing native Jujutsu repository in place. Use `--no-sync` with a
-supporting provider when you intentionally want to run without transferring
-local files.
+The immutable tree is materialized in a temporary Git checkout and passed
+through the normal manifest, exclude, seed, and overlay machinery. Raw blob
+contents, executable bits, and symlink targets are preserved without checkout
+filters. `.jj` metadata is excluded. Changes made after selection belong to the
+next run. `sync-plan --json` reports `source: "jj"` and the full `revision`.
+
+For seeding and Git overlay, Crabbox explicitly maps jj's `origin` remote
+bookmarks to Git remote-tracking refs. `sync.baseRef`, when set, must name one
+of those bookmarks (for example `origin/main`). Otherwise the first bookmark
+in name order with shared ancestry supplies the base. The base is the unique
+merge base of that bookmark and `@`, so it remains reachable from the advertised
+origin branch. The normal remote ancestry check still applies. With no eligible
+origin bookmark, Crabbox transfers the full tree without origin seeding.
+
+Missing jj, unsupported jj commands/backends, stale workspaces, divergent
+operation heads, divergent or conflicted `@`, conflicted origin bookmarks, and
+ambiguous merge bases fail before lease acquisition. Resolve those conditions
+in jj and retry. Git submodules are not supported in this adapter. Use external
+Crabbox state storage; native sync rejects state directories inside the workspace.
+Ready pools, Actions hydration, delegated-run providers, and local Git object
+seeding are currently unsupported; use an ordinary SSH provider with
+`--no-hydrate`. `sync.source=directory` still rejects native workspaces.
+
+Colocated `.jj` + `.git` workspaces continue through the existing Git path.
+`--no-sync` on a supporting provider intentionally skips local revision mapping.
 
 The built-in excludes are intentionally conservative. They cover common churn
 such as `node_modules`, `.git`, `dist`, `coverage`, `playwright-report`,
@@ -311,12 +343,14 @@ Once ownership is established, sync runs these steps:
    `No changes detected, skipping sync` and skip the rest.
 5. On `--full-resync` / `--fresh-sync`, reset the remote workdir first.
 6. Seed the remote Git tree from `origin` at the local `HEAD` when the runner
-   can fetch that commit, so rsync only ships the diff.
+   can fetch that commit, and record the files created by verified seeds so the
+   first prune also removes excluded tracked paths.
 7. Write the manifest (and the deletion list) to the remote workdir.
 8. When delete-sync is enabled, prune previously synced remote files that are no
    longer in the manifest.
-9. rsync the working set with `--files-from=- --from0` (the manifest drives the
-   transfer).
+9. rsync the selected files with `--files-from=- --from0`. A verified POSIX
+   seed uses the local delta plus tracked remote edits; other workspaces use
+   the full manifest.
 10. Finalize: git-hydrate the worktree against the configured base ref, run the
     mass-deletion sanity check, and record the new fingerprint.
 
@@ -330,6 +364,8 @@ The stream contains the selected manifest files and their parent-directory
 metadata, preserves symlinks without following their targets, and leaves the
 workspace root's permissions intact. Pruning and finalization use their existing
 paths, and producer or transport failure prevents finalization.
+Non-UTF-8 POSIX filenames and symlink targets retain their exact bytes when the
+destination filesystem supports them.
 
 Nonempty workspaces, enabled Git seeding and requested Git overlays (including
 their plain-manifest fallback paths), local Git snapshots,
@@ -383,6 +419,32 @@ ignores the remote fingerprint and forces a clean transfer.
 
 Git seeding (`sync.gitSeed`, default on) clones or fetches the base tree on the
 runner before rsync, so only your diff travels over the wire.
+On POSIX targets, a verified exact-commit seed selects `seeded-delta` transfer
+mode automatically. Only local additions, edits, untracked files, and tracked
+remote edits enter rsync's file list; the full manifest still controls deletions,
+excludes, and finalization. Reused workspaces include previous edits that have
+since been reverted locally and files changed by remote commands. Delta files
+use checksums so same-size edits with unchanged timestamps are repaired. Clean
+seeded files retain their checkout timestamps instead of being read by rsync
+solely because the local timestamps differ. Nonstandard file permissions also
+enter the delta. Ordinary `text=auto eol=lf` repositories are supported. Working files whose
+sizes differ from their Git blobs also enter the delta, including CRLF bytes
+that Git considers clean after normalization. Blob-size metadata avoids reading
+every working file to classify its line endings.
+
+This optimization requires matching remote HEAD and index trees, ordinary Git
+checkout semantics, and readable, unambiguous metadata. Sparse/hidden index
+entries, filters/encodings/ident attributes or transforming configuration, changed remote
+attributes, explicit `sync.checksum: true`, unsupported targets, and failed
+verification retain full-manifest sync. It does not reset the remote checkout or remove unmanaged build caches.
+Timing output reports `syncMode: "seeded-delta"`, `syncTransferFiles`, and
+`syncTransferBytes`.
+
+POSIX rsync receivers register directly with the workspace owner before
+receiving files. Their witnessed lifetime ends with the receiver, including
+failed transfers, so an unrelated rsync process cannot keep a detached guard
+alive and block the next run. WSL2 retains its platform-specific phase guard.
+
 Origin seeding only installs a clone into an absent or empty destination. A
 non-empty directory without Git metadata keeps its files and uses plain manifest
 sync, with Git coherence and reusable fingerprints disabled for that transfer.
@@ -530,6 +592,11 @@ are supported; the resulting bundle has no dependency on those stores.
 Preparation does not fetch missing objects. Incomplete selected histories,
 unreadable tag targets, conflicts, hidden sparse paths, assume-unchanged entries,
 and submodules fail with a local diagnostic instead of silently dropping metadata.
+A shallow source checkout with missing selected history fails with a diagnostic
+naming the shallow source. Run `git fetch --unshallow`, or set
+`sync.gitSeed: false` and `sync.gitSeedSource: origin` for file-only sync.
+Shallow markers alone do not prevent seeding when the complete selected history
+is available locally.
 The combined full file payload and uncompressed Git objects count against ordinary
 sync size guardrails, even when the dirty delta is small. The existing allow-large
 override affects those soft limits only. Separate hard bounds limit each of the
@@ -553,7 +620,10 @@ or verification never falls back to origin or file-only sync. Cleanup failures
 report retained temporary state instead of declaring a successful transfer.
 
 Actions hydration, fresh PR checkouts, ready pools, directory sync, and Git overlay
-have different metadata owners and cannot be combined with local seeding. Use a
+have different metadata owners and cannot be combined with local seeding. Git
+overlay fetches origin on the runner; set `sync.gitOverlay: false` when using
+local seeding. For file-only sync, set `sync.gitSeed: false` and
+`sync.gitSeedSource: origin`. Use a
 raw workspace and `--no-hydrate` when Actions hydration is configured. `--no-sync`
 does not prepare or transfer a local seed. Existing mass-deletion guardrails still
 apply, including when many tracked paths are intentionally excluded.

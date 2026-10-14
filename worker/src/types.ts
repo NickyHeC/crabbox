@@ -1,4 +1,6 @@
 import type { AWSQualificationTransportBinding } from "./aws-qualification-contract";
+import type { LeaseLifetimePolicy } from "./lease-lifetime";
+import type { ServeRelayBackend } from "./serve-relay";
 
 export interface AWSCredentials {
   accessKeyId: string;
@@ -10,8 +12,27 @@ export interface AWSCredentials {
 export type AWSCredentialProvider = () => Promise<AWSCredentials>;
 
 export interface Env {
+  CRABBOX_LEASE_DEFAULT_TTL_SECONDS?: string;
+  CRABBOX_LEASE_DEFAULT_IDLE_TIMEOUT_SECONDS?: string;
+  CRABBOX_LEASE_MAX_TTL_SECONDS?: string;
+  CRABBOX_LEASE_EXTENSION?: string;
+  CRABBOX_LEASE_AUTO_EXTEND?: string;
+  CRABBOX_LEASE_POLICY_OVERRIDES?: string;
+  CRABBOX_RETAINED_RECONCILE?: string;
+  CRABBOX_RETAINED_RECONCILE_DELETE?: string;
+  CRABBOX_RETAINED_RECONCILE_GRACE_SECONDS?: string;
+  CRABBOX_RETAINED_RECONCILE_BUDGET?: string;
+  CRABBOX_RETAINED_RECONCILE_LOOKUP_BUDGET?: string;
+  CRABBOX_RETAINED_RECONCILE_INTERVAL_SECONDS?: string;
+
+  CRABBOX_LEASE_LIFETIME_MODE?: string;
+  CRABBOX_BATCH_MAX_AGE_SECONDS?: string;
+  CRABBOX_INTERACTIVE_MAX_AGE_SECONDS?: string;
+  CRABBOX_STOPPED_RETENTION_SECONDS?: string;
   CRABBOX_PORTABLE_POOLS_ENABLED?: string;
   FLEET: DurableObjectNamespace;
+  SERVE_RELAY?: DurableObjectNamespace;
+  serveRelayBackend?: ServeRelayBackend;
   CF_VERSION_METADATA?: {
     id: string;
     tag?: string;
@@ -99,6 +120,7 @@ export interface Env {
   CRABBOX_RUNTIME_ADAPTER_TOKEN?: string;
   CRABBOX_SHARED_TOKEN?: string;
   CRABBOX_SHARED_OWNER?: string;
+  CRABBOX_SERVE_ALLOWED_OWNERS?: string;
   CRABBOX_ADMIN_TOKEN?: string;
   CRABBOX_SESSION_SECRET?: string;
   CRABBOX_DURABLE_PROVISIONING_ADMISSION?: string;
@@ -161,6 +183,8 @@ export interface Env {
   CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_PER_OWNER?: string;
   CRABBOX_MAX_CHECKPOINT_USE_CLAIMS_TOTAL?: string;
   CRABBOX_CAPACITY_ADMIN_OWNERS?: string;
+  CRABBOX_DEPLOYMENT_CAPACITY_ADMIN_OWNERS?: string;
+  CRABBOX_SHARED_CAPACITY_OVERRIDE_OWNERS?: string;
   CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN?: string;
   CRABBOX_MAX_MONTHLY_USD?: string;
   CRABBOX_MAX_MONTHLY_USD_PER_OWNER?: string;
@@ -188,7 +212,14 @@ export interface Env {
   CRABBOX_ARTIFACTS_URL_EXPIRES_SECONDS?: string;
 }
 
+export interface CapacityRequirements {
+  minVCPUs?: number;
+  minMemoryMiB?: number;
+}
+
 export interface LeaseRequest {
+  serveMachine?: string;
+  lifetimePolicy?: import("./lease-lifetime").LeaseLifetimeRequest;
   leaseID?: string;
   createAttemptID?: string;
   slug?: string;
@@ -219,6 +250,7 @@ export interface LeaseRequest {
   image?: string;
   awsRegion?: string;
   awsAMI?: string;
+  awsUseStockImage?: boolean;
   awsSnapshot?: string;
   awsSGID?: string;
   awsSubnetID?: string;
@@ -248,6 +280,8 @@ export interface LeaseRequest {
   gcpRootGB?: number;
   gcpServiceAccount?: string;
   capacity?: {
+    minVCPUs?: number;
+    minMemoryMiB?: number;
     market?: "spot" | "on-demand";
     strategy?: "most-available" | "price-capacity-optimized" | "capacity-optimized" | "sequential";
     fallback?: string;
@@ -347,6 +381,15 @@ export interface LeaseRegistrationRequest {
 
 export const coordinatorProviderRegistry = [
   {
+    runtimeExtension: true,
+    provider: "serve",
+    label: "Served machines",
+    requiredSecrets: [],
+    adminAudit: false,
+    supportsCapacityMarket: false,
+  },
+  {
+    runtimeExtension: true,
     provider: "hetzner",
     label: "Hetzner",
     requiredSecrets: ["HETZNER_TOKEN"],
@@ -354,6 +397,7 @@ export const coordinatorProviderRegistry = [
     supportsCapacityMarket: false,
   },
   {
+    runtimeExtension: true,
     provider: "aws",
     label: "AWS",
     requiredSecrets: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
@@ -361,6 +405,7 @@ export const coordinatorProviderRegistry = [
     supportsCapacityMarket: true,
   },
   {
+    runtimeExtension: true,
     provider: "azure",
     label: "Azure",
     requiredSecrets: [
@@ -373,6 +418,7 @@ export const coordinatorProviderRegistry = [
     supportsCapacityMarket: true,
   },
   {
+    runtimeExtension: true,
     provider: "gcp",
     label: "GCP",
     requiredSecrets: ["GCP_CLIENT_EMAIL", "GCP_PRIVATE_KEY"],
@@ -380,6 +426,7 @@ export const coordinatorProviderRegistry = [
     supportsCapacityMarket: true,
   },
   {
+    runtimeExtension: false,
     provider: "daytona",
     label: "Daytona",
     requiredSecrets: ["DAYTONA_CRABBOX_KEY"],
@@ -387,6 +434,7 @@ export const coordinatorProviderRegistry = [
     supportsCapacityMarket: false,
   },
 ] as const satisfies readonly {
+  runtimeExtension: boolean;
   provider: string;
   label: string;
   requiredSecrets: readonly (keyof Env)[];
@@ -399,7 +447,6 @@ export type Provider = CoordinatorProviderSpec["provider"];
 export const coordinatorProviders = coordinatorProviderRegistry.map(
   (spec) => spec.provider,
 ) as Provider[];
-export const providers = coordinatorProviders;
 
 export function isCoordinatorProvider(provider: string): provider is Provider {
   return coordinatorProviders.includes(provider as Provider);
@@ -455,6 +502,34 @@ export interface HetznerCleanupEvidence {
 export type ProviderCleanupEvidence = HetznerCleanupEvidence;
 
 export interface LeaseRecord {
+  leasePolicy?: import("./config").LeasePolicy;
+  policyNotice?: string;
+  extensionHistory?: {
+    at: string;
+    actor: string;
+    fromTTL: number;
+    toTTL: number;
+    reason?: string;
+  }[];
+  retainedReconcileDeleteClaim?: string;
+  retainedReconcileDeleteCredentialFingerprint?: string;
+  retainedReconcileObservation?: {
+    fingerprint: string;
+    credentialFingerprint: string;
+    firstAbsentAt: string;
+    lastAbsentAt: string;
+  };
+  cleanupConfirmedBy?: "retained-reconcile";
+  serve?: import("./serve").ServeAssignment;
+  serveIntent?: string;
+  sshHostKeyFingerprint?: string;
+  imageEvidence?: {
+    configuredReference: string;
+    runtimeImageId: string;
+    repositoryDigests: string[];
+    repositoryDigestStatus: string;
+  };
+  capacityRequirements?: CapacityRequirements;
   creationEvents?: CreationEvent[];
   portablePoolAccess?: true;
   id: string;
@@ -521,11 +596,21 @@ export interface LeaseRecord {
   sshUser: string;
   sshPort: string;
   sshFallbackPorts?: string[];
+  serveRelaySessions?: string[];
+  sshJump?: {
+    host: string;
+    port: number;
+    hostKey: string;
+    fingerprint: string;
+    candidates?: { host: string; port: number }[];
+    relay?: boolean;
+  };
   sshHostKey?: string;
   providerAccessExpiresAt?: string;
   workRoot: string;
   keep: boolean;
   ttlSeconds: number;
+  lifetimePolicy?: LeaseLifetimePolicy | undefined;
   idleTimeoutSeconds?: number;
   estimatedHourlyUSD: number;
   maxEstimatedUSD: number;
@@ -1021,6 +1106,7 @@ export interface PromotedImageRecord extends ProviderImage {
 }
 
 export interface RunRecord {
+  eventAppendIdempotent?: boolean;
   id: string;
   leaseID: string;
   leaseIDs?: string[];
@@ -1136,6 +1222,7 @@ export interface ExternalRunnerInput {
 
 export interface ExternalRunnerSyncRequest {
   provider?: string;
+  inventoryScope?: "org";
   runners?: ExternalRunnerInput[];
 }
 
@@ -1183,6 +1270,7 @@ export interface RunEventRecord {
 }
 
 export interface RunEventRequest {
+  id?: string;
   type?: string;
   phase?: string;
   stream?: "stdout" | "stderr";
@@ -1244,18 +1332,6 @@ export interface HetznerSSHKey {
   labels?: Record<string, string>;
 }
 
-export interface MachineView {
-  id: string;
-  provider: Provider;
-  cloudID: string;
-  name: string;
-  status: string;
-  serverType: string;
-  hostId?: string;
-  host: string;
-  labels: Record<string, string>;
-}
-
 export interface ProviderMachine {
   creationEvents?: CreationEvent[];
   provider: Provider;
@@ -1271,6 +1347,9 @@ export interface ProviderMachine {
   privateHost?: string;
   awsIPv6Addresses?: string[];
   awsKeyName?: string;
+  awsSpotInstanceRequestID?: string;
+  awsStateReasonCode?: string;
+  awsStateReasonMessage?: string;
   awsSubnetID?: string;
   awsSecurityGroupIDs?: string[];
   awsInstanceProfileAttached?: boolean;

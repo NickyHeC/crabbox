@@ -95,6 +95,7 @@ func (p *privateNet) UnmarshalJSON(data []byte) error {
 }
 
 type Server struct {
+	LifetimePolicy      *LeaseLifetimePolicy `json:"lifetimePolicy,omitempty"`
 	CloudID             string
 	Provider            string
 	HostID              string
@@ -293,6 +294,11 @@ func (c *HetznerClient) CreateServer(ctx context.Context, cfg Config, publicKey,
 	}
 	now := time.Now().UTC()
 	labels := DirectLeaseLabels(cfg, leaseID, slug, "hetzner", "", keep, now)
+	cfg = WithGuestLeaseExpiry(cfg, labels)
+	userData, err := hetznerUserData(cloudInit(cfg, publicKey))
+	if err != nil {
+		return Server{}, err
+	}
 	body := map[string]any{
 		"name":               name,
 		"server_type":        cfg.ServerType,
@@ -300,7 +306,7 @@ func (c *HetznerClient) CreateServer(ctx context.Context, cfg Config, publicKey,
 		"location":           cfg.Location,
 		"labels":             labels,
 		"ssh_keys":           []string{cfg.ProviderKey},
-		"user_data":          cloudInit(cfg, publicKey),
+		"user_data":          userData,
 		"start_after_create": true,
 		"public_net": map[string]any{
 			"enable_ipv4": true,

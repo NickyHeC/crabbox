@@ -1,10 +1,12 @@
 import type { CoordinatorStorageView } from "./coordinator-runtime";
 
+export const storageRecordScanBatchSize = 128;
+
 // Read ordered, bounded pages lazily. Callers own transactions, record policy,
 // and early termination; a consumer that stops never fetches another page.
 export async function* coordinatorStorageEntries<T>(
   storage: Pick<CoordinatorStorageView, "list">,
-  options: { prefix: string; limit: number; noCache?: boolean },
+  options: { prefix: string; limit: number; noCache?: boolean; allowConcurrency?: boolean },
 ): AsyncGenerator<[string, T]> {
   let startAfter: string | undefined;
   for (;;) {

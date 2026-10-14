@@ -449,6 +449,15 @@ func prepareLocalGitSeedArtifact(ctx context.Context, root string, selection loc
 		return nil
 	})
 	if err != nil {
+		// Keep the full closure walk above; shallow markers alone do not imply
+		// missing history, and cannot explain a parser or consumer refusal.
+		var writeErr *localGitSeedWriteError
+		var commandErr *exec.ExitError
+		if errors.As(err, &commandErr) && !errors.As(err, &writeErr) && ctx.Err() == nil {
+			if shallow, shallowErr := localGitSeedSourceOutput(ctx, root, "rev-parse", "--is-shallow-repository"); shallowErr == nil && shallow == "true" {
+				return artifact, fmt.Errorf("enumerate complete required local Git objects: source repository is shallow; run git fetch --unshallow, or set sync.gitSeed=false and sync.gitSeedSource=origin for file-only sync: %w", err)
+			}
+		}
 		return artifact, fmt.Errorf("enumerate complete required local Git objects: %w", err)
 	}
 	if !commits[selection.Head] || (selection.Base != "" && !commits[selection.Base]) {

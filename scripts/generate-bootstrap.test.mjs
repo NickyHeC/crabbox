@@ -62,6 +62,26 @@ test("generation is reproducible and every checked-in output is current", async 
   for (const [path, source] of first) assert.equal(await readFile(resolve(repoRoot, path), "utf8"), source, path);
 });
 
+test("bootstrap package hooks cannot restart cloud-init, even with inherited automatic mode", async (t) => {
+  const directory = await temporary(t);
+  await writeFile(join(directory, "apt-get"), `#!/bin/sh
+if [ "$1" = install ]; then
+  # Model needrestart's APT hook: Ubuntu defaults to automatic restarts.
+  if [ "\${NEEDRESTART_MODE:-a}" != l ]; then
+    echo 'cloud-init-main.service restarted' >&2
+    exit 1
+  fi
+  echo 'pending service restarts reported'
+fi
+`, { mode: 0o755 });
+  for (const inherited of ["", "a"]) {
+    const output = run("bash", ["-euc", shared.sharedLinuxBootstrapPrelude() + "\napt-get install -y jq"], {
+      env: { ...process.env, PATH: directory + ":" + process.env.PATH, NEEDRESTART_MODE: inherited },
+    });
+    assert.match(output, /pending service restarts reported/);
+  }
+});
+
 test("artifact and catalog schemas reject malformed or ambiguous data", () => {
   for (const mutate of [
     (d) => { d.artifacts.extra = {}; },
@@ -86,6 +106,10 @@ test("artifact and catalog schemas reject malformed or ambiguous data", () => {
     (d) => { d.supported = [d.default, d.default]; },
     (d) => { d.aliases.test = "missing"; },
     (d) => { d.aliases[d.default] = d.default; },
+    (d) => { d.images.find((image) => image.Target === "windows").Provider = "azure"; },
+    (d) => { d.images.find((image) => image.Target === "windows").ContainerName = d.images[0].ContainerName; },
+    (d) => { d.images.find((image) => image.Target === "windows").AWSName = ""; },
+
   ]) {
     const document = structuredClone(sources.catalog); mutate(document);
     assert.throws(() => validateCatalog(document));

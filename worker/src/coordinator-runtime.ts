@@ -1,6 +1,9 @@
 import { AsyncMutex } from "./async-mutex";
 export interface CoordinatorStorageView {
-  get<T>(key: string, options?: { noCache?: boolean }): Promise<T | undefined>;
+  get<T>(
+    key: string,
+    options?: { noCache?: boolean; allowConcurrency?: boolean },
+  ): Promise<T | undefined>;
   put<T>(key: string, value: T, options?: { noCache?: boolean }): Promise<void>;
   delete(key: string): Promise<unknown>;
   list<T>(options?: {
@@ -8,6 +11,7 @@ export interface CoordinatorStorageView {
     limit?: number;
     startAfter?: string;
     noCache?: boolean;
+    allowConcurrency?: boolean;
   }): Promise<Map<string, T>>;
 }
 
@@ -76,6 +80,18 @@ export function coordinatorRequestQueue(request: Request): CoordinatorRequestQue
   const url = new URL(request.url);
   const path = url.pathname.split("/").filter(Boolean);
   const method = request.method.toUpperCase();
+  if (path[0] === "v1" && path[1] === "serve") return "direct";
+  if (method === "POST" && path.join("/") === "v1/admin/tailscale-preflight") {
+    return "direct";
+  }
+  if (
+    method === "GET" &&
+    ["v1/whoami", "v1/leases", "v1/admin/leases", "v1/admin/retained-reconcile"].includes(
+      path.join("/"),
+    )
+  ) {
+    return "direct";
+  }
   if (
     (method === "POST" && path.join("/") === "v1/auth/github/start") ||
     (method === "GET" && path.join("/") === "portal/login")
@@ -96,6 +112,7 @@ export function coordinatorRequestQueue(request: Request): CoordinatorRequestQue
     method === "POST" &&
     (path.join("/") === "v1/leases" ||
       path.join("/") === "v1/leases/capability-aware" ||
+      path.join("/") === "v1/leases/resource-constrained" ||
       path.join("/") === "v1/leases/from-checkpoint")
   ) {
     return "direct";
@@ -108,7 +125,8 @@ export function coordinatorRequestQueue(request: Request): CoordinatorRequestQue
     path[0] === "v1" &&
     path[1] === "leases" &&
     path[2] &&
-    (path.length === 3 || (path.length === 4 && path[3] === "from-checkpoint"))
+    (path.length === 3 ||
+      (path.length === 4 && ["from-checkpoint", "resource-constrained"].includes(path[3] ?? "")))
   ) {
     return "direct";
   }
@@ -185,6 +203,7 @@ export function coordinatorRequestQueue(request: Request): CoordinatorRequestQue
     path[2] &&
     method === "POST" &&
     (path[3] === "heartbeat" ||
+      path[3] === "extend" ||
       path[3] === "tailscale" ||
       path[3] === "release" ||
       path[3] === "cancel-create")
@@ -203,6 +222,17 @@ export function coordinatorRequestQueue(request: Request): CoordinatorRequestQue
       path[2] === "azure-orphan-sweep" ||
       (path[2] === "leases" && method === "POST"))
   ) {
+    return "direct";
+  }
+  if (
+    method === "GET" &&
+    path.length === 5 &&
+    path[0] === "v1" &&
+    path[1] === "admin" &&
+    path[2] === "leases" &&
+    path[4] === "lifetime-readback"
+  ) {
+    // Read-only provider readback; holding the lifecycle queue would stall admissions on AWS I/O.
     return "direct";
   }
   if (
@@ -264,7 +294,11 @@ export interface CoordinatorRuntime {
     tags: string[],
     handlers: CoordinatorSocketHandlers,
   ): void;
-  acceptEphemeralWebSocket(socket: WebSocket, handlers: CoordinatorSocketHandlers): void;
+  acceptEphemeralWebSocket(
+    socket: WebSocket,
+    handlers: CoordinatorSocketHandlers,
+    kind?: string,
+  ): void;
   take<T>(key: string): Promise<T | undefined>;
   getAlarm(): Promise<number | undefined>;
   scheduleAlarm(time: number): Promise<void>;
@@ -334,7 +368,11 @@ export class CloudflareCoordinatorRuntime implements CoordinatorRuntime {
     });
   }
 
-  acceptEphemeralWebSocket(socket: WebSocket, handlers: CoordinatorSocketHandlers): void {
+  acceptEphemeralWebSocket(
+    socket: WebSocket,
+    handlers: CoordinatorSocketHandlers,
+    _kind?: string,
+  ): void {
     socket.accept();
     socket.addEventListener("message", (event) => {
       void handlers.message(event.data);

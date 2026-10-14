@@ -36,8 +36,15 @@ import {
   type LeaseConfig,
 } from "./config";
 import { creationEvent, observedRunning, measureCreationStep } from "./creation-events";
+import { sha256Hex } from "./encoding";
 import { hasImageRequirements } from "./image-capabilities";
 import { osImageSpec } from "./os-image";
+import {
+  providerRequestSignal,
+  providerRequestTimeoutMs,
+  providerSleep,
+  waitForProviderSignal,
+} from "./provider-deadline";
 import {
   leaseIDForProviderKey,
   providerKeyForLease,
@@ -47,6 +54,7 @@ import {
 import { leaseProviderLabels } from "./provider-labels";
 import { withPricingDeadline } from "./provider-pricing";
 import { ProvisioningAttemptHistory } from "./provisioning-attempts";
+import { defaultRootGB } from "./root-disk";
 import { leaseProviderName } from "./slug";
 import type {
   AWSCredentialProvider,
@@ -126,7 +134,8 @@ const awsInstanceVisibilityBackoffMs = [1_000, 2_000, 4_000, 8_000, 15_000, 30_0
 // Leave room below Workers' six-connection limit for concurrent quota discovery.
 const awsIngressBatchSize = 4;
 
-class AWSQueryError extends Error {
+export class AWSQueryError extends Error {
+  retryAfter?: string | undefined;
   constructor(
     readonly action: string,
     readonly status: number,
@@ -135,6 +144,10 @@ class AWSQueryError extends Error {
   ) {
     super(`aws ${action}: http ${status}: ${detail}`);
   }
+}
+
+class AWSImageNotFoundError extends Error {
+  override name = "AWSImageNotFoundError";
 }
 
 async function readAWSCapacityErrorBody(response: Response): Promise<string | undefined> {
@@ -353,7 +366,10 @@ interface AWSQueryOptions {
   skipExpectedIdentity?: boolean;
 }
 
-interface AWSLeaseOperation {
+export interface AWSLeaseOperation {
+  credentialFingerprint(): Promise<string>;
+  findServers(instanceIDs: string[]): Promise<Map<string, ProviderMachine>>;
+  sshKeyAbsent(name: string, leaseID: string): Promise<boolean>;
   readonly region: string;
   readonly client: EC2SpotClient;
   verifiedIdentity(): Promise<AWSIdentity>;
@@ -361,6 +377,16 @@ interface AWSLeaseOperation {
   waitForServerVisibility(instanceID: string): Promise<ProviderMachine>;
   findCrabboxServerByLease(leaseID: string): Promise<ProviderMachine | undefined>;
   findWorkspaceServerByLease(leaseID: string): Promise<ProviderMachine | undefined>;
+  stopRetainedServer(
+    instanceID: string,
+    leaseID: string,
+    identity: string,
+    assertOwner: () => Promise<void>,
+  ): Promise<void>;
+  retainedServerIdentity(instanceID: string, leaseID: string): Promise<string>;
+  checkRetainedStopPermission(instanceID: string, leaseID: string): Promise<string>;
+  retainedVolumePresent(identity: string, leaseID: string): Promise<boolean>;
+  confirmRetainedVolumeDeleted(identity: string): Promise<void>;
   terminateServerAndWait(instanceID: string): Promise<void>;
   deleteSSHKey(name: string, leaseID: string): Promise<void>;
 }
@@ -837,12 +863,20 @@ export class EC2SpotClient {
     );
   }
 
-  async withLeaseOperation<T>(operation: (session: AWSLeaseOperation) => Promise<T>): Promise<T> {
+  async withLeaseOperation<T>(
+    operation: (session: AWSLeaseOperation) => Promise<T>,
+    signal = this.requestSignal,
+  ): Promise<T> {
     // One snapshot owns the full regional operation, including quota and SSM calls.
     const snapshot = this.credentialProvider
-      ? resolvedAWSCredentials(await this.credentialProvider())
-      : undefined;
-    const client = snapshot ? new EC2SpotClient(this.env, this.region, snapshot) : this;
+      ? resolvedAWSCredentials(
+          await waitForProviderSignal(
+            providerRequestSignal(providerRequestTimeoutMs, signal, "aws", "credential snapshot"),
+            () => this.credentialProvider!(),
+          ),
+        )
+      : this.credentialSnapshot;
+    const client = new EC2SpotClient(this.env, this.region, snapshot, signal);
     const ec2 = client.aws;
     const sts = client.stsClient;
     let identity: Promise<AWSIdentity> | undefined;
@@ -865,6 +899,23 @@ export class EC2SpotClient {
     return await operation({
       region: this.region,
       client,
+      credentialFingerprint: () => {
+        const credentials = snapshot ?? this.credentialSnapshot;
+        if (!credentials)
+          throw new AWSLeaseAuthorityError(
+            "retained reconciliation requires a fixed credential snapshot",
+          );
+        return sha256Hex(
+          JSON.stringify([
+            credentials.accessKeyId,
+            credentials.secretAccessKey,
+            credentials.sessionToken,
+          ]),
+        );
+      },
+      findServers: (ids) => withAccount((account) => client.findServersWith(ids, query(account))),
+      sshKeyAbsent: (name, leaseID) =>
+        withAccount((account) => client.sshKeyAbsentWith(name, leaseID, query(account))),
       verifiedIdentity,
       findServer: (instanceID) =>
         withAccount((account) => client.findServerWith(instanceID, query(account))),
@@ -874,6 +925,32 @@ export class EC2SpotClient {
         withAccount((account) => client.findLeaseServer(leaseID, false, query(account))),
       findWorkspaceServerByLease: (leaseID) =>
         withAccount((account) => client.findLeaseServer(leaseID, true, query(account))),
+      stopRetainedServer: (instanceID, leaseID, retainedIdentity, assertOwner) =>
+        withAccount((account) =>
+          client.stopRetainedServerWith(
+            instanceID,
+            leaseID,
+            retainedIdentity,
+            assertOwner,
+            query(account),
+          ),
+        ),
+      confirmRetainedVolumeDeleted: (retainedIdentity) =>
+        withAccount((account) =>
+          client.confirmRetainedVolumeDeletedWith(retainedIdentity, query(account)),
+        ),
+      retainedServerIdentity: (instanceID, leaseID) =>
+        withAccount((account) =>
+          client.retainedServerIdentityWith(instanceID, leaseID, query(account)),
+        ),
+      checkRetainedStopPermission: (instanceID, leaseID) =>
+        withAccount((account) =>
+          client.checkRetainedStopPermissionWith(instanceID, leaseID, query(account)),
+        ),
+      retainedVolumePresent: (diskIdentity, leaseID) =>
+        withAccount((account) =>
+          client.retainedVolumePresentWith(diskIdentity, leaseID, query(account)),
+        ),
       terminateServerAndWait: (instanceID) =>
         withAccount((account) => client.terminateServerAndWaitWith(instanceID, query(account))),
       deleteSSHKey: (name, leaseID) =>
@@ -1014,9 +1091,10 @@ export class EC2SpotClient {
       const instanceType = asString(item["instanceType"]);
       if (!requested.includes(instanceType)) continue;
       const vcpus = Number(asString(record(item["vCpuInfo"])["defaultVCpus"]));
+      const memoryMiB = Number(asString(record(item["memoryInfo"])["sizeInMiB"]));
       described.set(instanceType, {
         vcpus: Number.isSafeInteger(vcpus) && vcpus > 0 ? vcpus : 0,
-        memoryMiB: positiveInt(asString(record(item["memoryInfo"])["sizeInMiB"])),
+        memoryMiB: Number.isSafeInteger(memoryMiB) && memoryMiB > 0 ? memoryMiB : 0,
         architectures: items(
           record(record(item["processorInfo"])["supportedArchitectures"])["item"],
         ).map(asString),
@@ -1039,6 +1117,46 @@ export class EC2SpotClient {
       // Metadata is advisory for ordinary launches; private workspace caps remain strict.
       return new Map();
     }
+  }
+
+  private async resourceQualifiedCandidates(config: LeaseConfig): Promise<{
+    candidates: string[];
+    vcpus: Map<string, number>;
+  }> {
+    const requirements = config.capacityRequirements!;
+    const candidates = awsLaunchCandidates(config);
+    let described: Map<string, AWSInstanceTypeInfo>;
+    try {
+      described = await this.describeInstanceTypes(candidates);
+    } catch (error) {
+      if (error instanceof AWSLeaseAuthorityError) throw error;
+      throw new Error(
+        "AWS capacity unavailable: cannot verify requested resource minimums from DescribeInstanceTypes",
+        { cause: error },
+      );
+    }
+    const eligible = candidates.filter((candidate) => {
+      const info = described.get(candidate);
+      return (
+        info !== undefined &&
+        (!requirements.minVCPUs || info.vcpus >= requirements.minVCPUs) &&
+        (!requirements.minMemoryMiB || info.memoryMiB >= requirements.minMemoryMiB)
+      );
+    });
+    if (!eligible.length) {
+      throw new Error(
+        `AWS capacity unavailable: no candidate has verified capacity for minVCPUs=${requirements.minVCPUs ?? 0} minMemoryMiB=${requirements.minMemoryMiB ?? 0}`,
+      );
+    }
+    return {
+      candidates: eligible,
+      vcpus: new Map(
+        eligible.flatMap((name) => {
+          const count = described.get(name)!.vcpus;
+          return count > 0 ? [[name, count] as const] : [];
+        }),
+      ),
+    };
   }
 
   private async assertPrivateWorkspaceInstanceTypes(
@@ -1293,6 +1411,13 @@ export class EC2SpotClient {
     let succeeded = false;
     let transientImageID = "";
     try {
+      // Hard minimums must be verified before creating keys, images or ingress.
+      // Ordinary requests retain their advisory metadata and candidate behavior.
+      const qualified = config.capacityRequirements
+        ? await diagnostics.measure("instance_types", () =>
+            this.resourceQualifiedCandidates(config),
+          )
+        : undefined;
       if (!config.awsPrivate) {
         await diagnostics.measure("key_pair", () =>
           this.ensureSSHKey(
@@ -1304,13 +1429,16 @@ export class EC2SpotClient {
         );
       }
       const capabilityImageRequired = hasImageRequirements(config.imageRequirements);
+      const automaticImageSelection =
+        config.selectedImage?.source === "promoted" ||
+        Object.keys(config.awsPromotedAMIs).length > 0;
       const defaultImageID = await diagnostics.measure("image", async () =>
         config.awsSnapshot
           ? await (async () => {
               transientImageID = await this.registerSnapshotImage(config.awsSnapshot, leaseID);
               return this.waitForImageAvailable(transientImageID);
             })()
-          : config.target === "macos" || capabilityImageRequired
+          : config.target === "macos" || capabilityImageRequired || automaticImageSelection
             ? ""
             : await this.resolveAMI(config),
       );
@@ -1356,13 +1484,15 @@ export class EC2SpotClient {
           `EC2 Mac Dedicated Host ${pinnedMacHostID} requires ${pinnedMacHostType}, not requested ${config.serverType}`,
         );
       }
-      const candidates = pinnedMacHostType ? [pinnedMacHostType] : awsLaunchCandidates(config);
+      const candidates =
+        qualified?.candidates ??
+        (pinnedMacHostType ? [pinnedMacHostType] : awsLaunchCandidates(config));
       const vcpus =
-        config.target === "macos"
+        qualified?.vcpus ??
+        (config.target === "macos"
           ? new Map<string, number>()
-          : await diagnostics.measure("instance_types", () => this.instanceTypeVCPUs(candidates));
-      const allowCapacityHandoff =
-        !config.awsPrivate && !config.serverTypeExplicit && config.target !== "macos";
+          : await diagnostics.measure("instance_types", () => this.instanceTypeVCPUs(candidates)));
+      const allowCapacityHandoff = !config.awsPrivate && config.target !== "macos";
       const hasQuotaEligibleCandidate = (
         serverTypes: string[],
         market: LeaseConfig["capacityMarket"],
@@ -1380,6 +1510,7 @@ export class EC2SpotClient {
         );
       const history = new ProvisioningAttemptHistory();
       const imageCache = new Map<string, string>();
+      const missingPromotedImages = new Set<string>();
       const marketFallbackCandidates: string[] = [];
       const pinnedMacOSImageID =
         config.target === "macos" ? config.awsAMI || this.env.CRABBOX_AWS_AMI || "" : "";
@@ -1390,8 +1521,14 @@ export class EC2SpotClient {
         const promotedImageID =
           config.awsPromotedAMIs[
             awsPromotedAMIConfigKey(this.region, candidateConfig.serverType)
-          ] ?? "";
-        if (promotedImageID) {
+          ] ??
+          (!capabilityImageRequired &&
+          config.selectedImage?.source === "promoted" &&
+          config.selectedImage.region === this.region &&
+          candidateConfig.serverType === config.serverType
+            ? config.selectedImage.id
+            : "");
+        if (promotedImageID && !missingPromotedImages.has(promotedImageID)) {
           return promotedImageID;
         }
         if (capabilityImageRequired) {
@@ -1399,23 +1536,88 @@ export class EC2SpotClient {
             `no AWS AMI found in ${this.region} for ${candidateConfig.serverType} satisfying the requested image capabilities`,
           );
         }
-        if (candidateConfig.target !== "macos") {
-          return this.resolveAMI(candidateConfig);
-        }
-        if (pinnedMacOSImageID && candidateConfig.serverType === config.serverType) {
+        if (
+          pinnedMacOSImageID &&
+          candidateConfig.serverType === config.serverType &&
+          !missingPromotedImages.has(pinnedMacOSImageID)
+        ) {
           return pinnedMacOSImageID;
         }
-        const query = awsMacOSAMIQuery(candidateConfig.serverType);
-        const cacheKey = `${query.name}\0${query.architecture}`;
+        const query =
+          candidateConfig.target === "macos"
+            ? awsMacOSAMIQuery(candidateConfig.serverType)
+            : undefined;
+        const cacheKey = query
+          ? `${query.name}\0${query.architecture}`
+          : `${candidateConfig.os}\0${candidateConfig.architecture}`;
         const cached = imageCache.get(cacheKey);
         if (cached) {
           return cached;
         }
-        const imageID = pinnedMacOSImageID
-          ? await this.resolveLatestAmazonAMI(query.name, query.architecture)
-          : await this.resolveAMI(candidateConfig);
+        const imageID = await this.resolveAMI({
+          ...candidateConfig,
+          awsUseStockImage:
+            candidateConfig.awsUseStockImage ||
+            automaticImageSelection ||
+            Boolean(pinnedMacOSImageID),
+        });
         imageCache.set(cacheKey, imageID);
         return imageID;
+      };
+      const createCandidate = async (
+        candidateConfig: LeaseConfig,
+        capacityHandoff?: () => Promise<boolean>,
+      ) => {
+        let imageID = await diagnostics.measure("image", () =>
+          resolveCandidateImageID(candidateConfig),
+        );
+        const launch = () =>
+          diagnostics.measure("instance_create", () =>
+            this.createServer(
+              candidateConfig,
+              leaseID,
+              slug,
+              owner,
+              imageID,
+              securityGroupID,
+              capacityHandoff,
+            ),
+          );
+        let server: ProviderMachine;
+        try {
+          server = await launch();
+        } catch (error) {
+          // Only a definite missing automatic image may change the launch image.
+          // Explicit images, snapshots and capability requirements retain their contract.
+          if (
+            !(
+              (error instanceof AWSQueryError && error.code === "InvalidAMIID.NotFound") ||
+              error instanceof AWSImageNotFoundError
+            ) ||
+            capabilityImageRequired ||
+            config.awsSnapshot ||
+            missingPromotedImages.has(imageID) ||
+            awsLeaseImageIdentity(candidateConfig, imageID, this.region).source !== "promoted"
+          ) {
+            throw error;
+          }
+          missingPromotedImages.add(imageID);
+          history.record(
+            {
+              region: this.region,
+              serverType: candidateConfig.serverType,
+              market: candidateConfig.capacityMarket,
+              category: "image",
+              message: error.message,
+            },
+            `${candidateConfig.serverType}: ${error.message}`,
+          );
+          imageID = await diagnostics.measure("image", () =>
+            resolveCandidateImageID(candidateConfig),
+          );
+          server = await launch();
+        }
+        return { server, imageID };
       };
       for (const [candidateIndex, serverType] of candidates.entries()) {
         const preflight = awsQuotaPreflightAttempt(
@@ -1435,6 +1637,7 @@ export class EC2SpotClient {
         const laterCandidates = candidates.slice(candidateIndex + 1);
         const canHandoffWithinMarket =
           allowCapacityHandoff &&
+          !config.serverTypeExplicit &&
           hasQuotaEligibleCandidate(laterCandidates, config.capacityMarket, initialQuota.value);
         const canCheckFallbackMarket =
           allowCapacityHandoff &&
@@ -1447,7 +1650,9 @@ export class EC2SpotClient {
                 // Extra-market quota I/O belongs only to an actual capacity rejection.
                 const quota = await quotaForMarket("on-demand");
                 return hasQuotaEligibleCandidate(
-                  [...marketFallbackCandidates, serverType, ...laterCandidates],
+                  config.serverTypeExplicit
+                    ? [serverType]
+                    : [...marketFallbackCandidates, serverType, ...laterCandidates],
                   "on-demand",
                   quota,
                 );
@@ -1455,20 +1660,9 @@ export class EC2SpotClient {
             : undefined;
         try {
           // oxlint-disable-next-line eslint/no-await-in-loop -- instance-type fallback may need an architecture-specific AMI.
-          const imageID = await diagnostics.measure("image", () =>
-            resolveCandidateImageID({ ...config, serverType }),
-          );
-          // oxlint-disable-next-line eslint/no-await-in-loop -- instance-type fallback must stay sequential.
-          const server = await diagnostics.measure("instance_create", () =>
-            this.createServer(
-              { ...config, serverType },
-              leaseID,
-              slug,
-              owner,
-              imageID,
-              securityGroupID,
-              capacityHandoff,
-            ),
+          const { server, imageID } = await createCandidate(
+            { ...config, serverType },
+            capacityHandoff,
           );
           const result: {
             server: ProviderMachine;
@@ -1518,31 +1712,17 @@ export class EC2SpotClient {
           }
           try {
             // oxlint-disable-next-line eslint/no-await-in-loop -- on-demand fallback may need an architecture-specific AMI.
-            const imageID = await diagnostics.measure("image", () =>
-              resolveCandidateImageID({
-                ...config,
-                capacityMarket: "on-demand",
-                serverType,
-              }),
-            );
-            // oxlint-disable-next-line eslint/no-await-in-loop -- on-demand fallback must stay sequential.
-            const server = await diagnostics.measure("instance_create", () =>
-              this.createServer(
-                { ...config, capacityMarket: "on-demand", serverType },
-                leaseID,
-                slug,
-                owner,
-                imageID,
-                securityGroupID,
-                allowCapacityHandoff &&
-                  hasQuotaEligibleCandidate(
-                    marketFallbackCandidates.slice(candidateIndex + 1),
-                    "on-demand",
-                    quota,
-                  )
-                  ? async () => true
-                  : undefined,
-              ),
+            const { server, imageID } = await createCandidate(
+              { ...config, capacityMarket: "on-demand", serverType },
+              allowCapacityHandoff &&
+                !config.serverTypeExplicit &&
+                hasQuotaEligibleCandidate(
+                  marketFallbackCandidates.slice(candidateIndex + 1),
+                  "on-demand",
+                  quota,
+                )
+                ? async () => true
+                : undefined,
             );
             const result: {
               server: ProviderMachine;
@@ -1573,7 +1753,7 @@ export class EC2SpotClient {
       }
       if (config.serverTypeExplicit) {
         throw history.error(
-          `requested exact AWS instance type ${config.serverType} failed; remove --type to allow class fallback: `,
+          `requested exact AWS instance type ${config.serverType} failed; remove --type to allow class fallback (regional quota limits still apply): `,
         );
       }
       throw history.error();
@@ -1705,6 +1885,45 @@ export class EC2SpotClient {
     return { kind: "present", server: instances[0]! };
   }
 
+  private async findServersWith(
+    ids: string[],
+    options: AWSQueryOptions,
+  ): Promise<Map<string, ProviderMachine>> {
+    if (!ids.length || ids.length > 200 || ids.some((id) => !/^i-[a-f0-9]{8,17}$/.test(id)))
+      throw new AWSLeaseAuthorityError("invalid exact instance batch");
+    const params = Object.fromEntries(ids.map((id, index) => [`InstanceId.${index + 1}`, id]));
+    const described = await this.describeInstances(params, options);
+    if (asString(described.root["nextToken"]))
+      throw new AWSLeaseObservationError("unexpected pagination in exact instance batch");
+    const result = new Map<string, ProviderMachine>();
+    for (const reservation of described.reservations) {
+      for (const value of items(record(reservation["instancesSet"])["item"])) {
+        const instance = record(value);
+        const id = asString(instance["instanceId"]);
+        if (!ids.includes(id) || result.has(id))
+          throw new AWSLeaseAuthorityError("unexpected or duplicate exact instance identity");
+        result.set(id, this.withRegion(instanceToMachine(instance)));
+      }
+    }
+    return result;
+  }
+
+  private async sshKeyAbsentWith(
+    name: string,
+    leaseID: string,
+    options: AWSQueryOptions,
+  ): Promise<boolean> {
+    if (name !== providerKeyForLease(leaseID))
+      throw new AWSLeaseAuthorityError("invalid owned key identity");
+    try {
+      await this.ec2("DescribeKeyPairs", { "KeyName.1": name }, options);
+      return false;
+    } catch (error) {
+      if (error instanceof AWSQueryError && error.code === "InvalidKeyPair.NotFound") return true;
+      throw error;
+    }
+  }
+
   async getServer(instanceID: string): Promise<ProviderMachine> {
     const lookup = await this.describeServer(instanceID);
     if (lookup.kind === "present") return lookup.server;
@@ -1760,6 +1979,7 @@ export class EC2SpotClient {
     while (Date.now() < deadline) {
       await checkReadiness?.();
       const server = await this.findServer(instanceID);
+      if (server) await this.assertAcquireState(server);
       await checkReadiness?.();
       if (Date.now() >= deadline) break;
       const address = server?.host || (allowPrivateAddress ? server?.privateHost : "");
@@ -1776,9 +1996,11 @@ export class EC2SpotClient {
 
   async waitForSSMOnline(instanceID: string, checkReadiness?: AWSReadinessCheck): Promise<void> {
     const deadline = Date.now() + 10 * 60_000;
+    const checkInstance = this.acquireStatePoll(instanceID);
     /* oxlint-disable eslint/no-await-in-loop -- Polling serially revalidates lease authority around each provider read. */
     while (Date.now() < deadline) {
       await checkReadiness?.();
+      await checkInstance();
       let result: Record<string, unknown>;
       try {
         result = await this.ssm("DescribeInstanceInformation", {
@@ -1807,6 +2029,48 @@ export class EC2SpotClient {
     }
     /* oxlint-enable eslint/no-await-in-loop */
     throw new Error(`timed out waiting for AWS SSM managed-node readiness: ${instanceID}`);
+  }
+
+  private acquireStatePoll(instanceID: string): AWSReadinessCheck {
+    let nextCheck = Date.now() + 15_000;
+    return async () => {
+      if (Date.now() < nextCheck) return;
+      const server = await this.findServer(instanceID);
+      if (server) await this.assertAcquireState(server);
+      nextCheck = Date.now() + 15_000;
+    };
+  }
+
+  private async assertAcquireState(server: ProviderMachine): Promise<void> {
+    let terminal = server.status === "shutting-down" || server.status === "terminated";
+    let reason = server.awsStateReasonCode ?? "";
+    let message = server.awsStateReasonMessage ?? "";
+    if (server.awsSpotInstanceRequestID) {
+      // Preserve terminal evidence even when an older IAM policy cannot read Spot diagnostics.
+      const root = await this.ec2("DescribeSpotInstanceRequests", {
+        "SpotInstanceRequestId.1": server.awsSpotInstanceRequestID,
+      }).catch(() => undefined);
+      for (const value of items(record(root?.["spotInstanceRequestSet"])["item"])) {
+        const request = record(value);
+        const status = record(request["status"]);
+        const code = asString(status["code"]);
+        if (
+          asString(request["spotInstanceRequestId"]) === server.awsSpotInstanceRequestID &&
+          asString(request["instanceId"]) === server.cloudID &&
+          asString(request["state"]) === "closed" &&
+          code.startsWith("instance-terminated-")
+        ) {
+          terminal = true;
+          reason = code;
+          message = asString(status["message"]);
+        }
+      }
+    }
+    if (terminal) {
+      throw new Error(
+        `AWS instance ${server.cloudID} cannot finish acquiring: state=${server.status}; ${reason} ${message}`.trim(),
+      );
+    }
   }
 
   async assertPrivateWorkspaceRootVolume(
@@ -1873,9 +2137,11 @@ export class EC2SpotClient {
       throw new Error("AWS SSM SendCommand returned no command ID");
     }
     const deadline = Date.now() + 17 * 60_000;
+    const checkInstance = this.acquireStatePoll(instanceID);
     /* oxlint-disable eslint/no-await-in-loop -- Polling serially revalidates lease authority around each provider read. */
     while (Date.now() < deadline) {
       await checkReadiness?.();
+      await checkInstance();
       try {
         const invocation = await this.ssm("GetCommandInvocation", {
           CommandId: commandID,
@@ -1953,6 +2219,153 @@ export class EC2SpotClient {
       return;
     }
     await this.ec2("TerminateInstances", { "InstanceId.1": instanceID });
+  }
+
+  private async retainedServerIdentityWith(
+    instanceID: string,
+    leaseID: string,
+    options: AWSQueryOptions,
+  ): Promise<string> {
+    const root = await this.ec2("DescribeInstances", { "InstanceId.1": instanceID }, options);
+    const instances = items(record(root["reservationSet"])["item"]).flatMap((reservation) =>
+      items(record(record(reservation)["instancesSet"])["item"]).map(record),
+    );
+    if (instances.length !== 1)
+      throw new AWSLeaseObservationError("retained AWS instance is not uniquely visible");
+    const instance = instances[0]!;
+    const mappings = items(record(instance["blockDeviceMapping"])["item"]).map(record);
+    const rootName = asString(instance["rootDeviceName"]);
+    const rootMapping = mappings[0];
+    const ebs = record(rootMapping?.["ebs"]);
+    const volumeID = asString(ebs["volumeId"]);
+    const instanceType = asString(instance["instanceType"]);
+    if (
+      asString(instance["instanceId"]) !== instanceID ||
+      tagMap(instance["tagSet"])["lease"] !== leaseID ||
+      asString(instance["rootDeviceType"]) !== "ebs" ||
+      asString(instance["instanceLifecycle"]) ||
+      asString(instance["spotInstanceRequestId"]) ||
+      asString(record(instance["placement"])["hostId"]) ||
+      instanceType.startsWith("mac") ||
+      mappings.length !== 1 ||
+      asString(rootMapping?.["deviceName"]) !== rootName ||
+      !rootName ||
+      !/^vol-[a-f0-9]+$/.test(volumeID) ||
+      asString(ebs["deleteOnTermination"]) !== "true"
+    ) {
+      throw new AWSLeaseAuthorityError(
+        "lifetime retention requires an on-demand EBS-only instance with one owned root disk; Mac, Spot, and extra disks are unsupported",
+      );
+    }
+    const types = await this.ec2(
+      "DescribeInstanceTypes",
+      { "InstanceType.1": instanceType },
+      options,
+    );
+    const typeItems = items(record(types["instanceTypeSet"])["item"]).map(record);
+    if (
+      typeItems.length !== 1 ||
+      asString(typeItems[0]!["instanceType"]) !== instanceType ||
+      asString(typeItems[0]!["instanceStorageSupported"]) !== "false"
+    ) {
+      throw new AWSLeaseAuthorityError(
+        "lifetime retention cannot stop instances with local instance-store data",
+      );
+    }
+    const volumes = await this.ec2("DescribeVolumes", { "VolumeId.1": volumeID }, options);
+    const volumeItems = items(record(volumes["volumeSet"])["item"]).map(record);
+    const volume = volumeItems[0];
+    const attachments = items(record(volume?.["attachmentSet"])["item"]).map(record);
+    if (
+      volumeItems.length !== 1 ||
+      asString(volume?.["volumeId"]) !== volumeID ||
+      tagMap(volume?.["tagSet"])["lease"] !== leaseID ||
+      attachments.length !== 1 ||
+      asString(attachments[0]!["instanceId"]) !== instanceID ||
+      asString(attachments[0]!["device"]) !== rootName ||
+      asString(attachments[0]!["status"]) !== "attached"
+    ) {
+      throw new AWSLeaseAuthorityError("retained root disk ownership or attachment changed");
+    }
+    return `${instanceID}:${volumeID}:${rootName}`;
+  }
+
+  private async confirmRetainedVolumeDeletedWith(
+    identity: string,
+    options: AWSQueryOptions,
+  ): Promise<void> {
+    const match = /^i-[a-f0-9]+:(vol-[a-f0-9]+):\/dev\/[a-z0-9]+$/.exec(identity);
+    if (!match) throw new AWSLeaseAuthorityError("invalid retained AWS disk identity");
+    try {
+      await this.ec2("DescribeVolumes", { "VolumeId.1": match[1]! }, options);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("InvalidVolume.NotFound")) return;
+      throw error;
+    }
+    throw new AWSLeaseObservationError("retained root volume deletion has not been confirmed");
+  }
+
+  private async retainedVolumePresentWith(
+    identity: string,
+    leaseID: string,
+    options: AWSQueryOptions,
+  ): Promise<boolean> {
+    const match = /^i-[a-f0-9]+:(vol-[a-f0-9]+):\/dev\/[a-z0-9]+$/.exec(identity);
+    if (!match) throw new AWSLeaseAuthorityError("invalid retained AWS disk identity");
+    try {
+      const result = await this.ec2("DescribeVolumes", { "VolumeId.1": match[1]! }, options);
+      const volumes = items(record(result["volumeSet"])["item"]).map(record);
+      if (
+        volumes.length !== 1 ||
+        asString(volumes[0]!["volumeId"]) !== match[1] ||
+        tagMap(volumes[0]!["tagSet"])["lease"] !== leaseID
+      )
+        throw new AWSLeaseAuthorityError("retained AWS root volume readback ownership mismatch");
+      return true;
+    } catch (error) {
+      if (error instanceof AWSQueryError && error.code === "InvalidVolume.NotFound") return false;
+      throw error;
+    }
+  }
+
+  private async checkRetainedStopPermissionWith(
+    instanceID: string,
+    leaseID: string,
+    options: AWSQueryOptions,
+  ): Promise<string> {
+    const identity = await this.retainedServerIdentityWith(instanceID, leaseID, options);
+    try {
+      await this.ec2("StopInstances", { "InstanceId.1": instanceID, DryRun: "true" }, options);
+    } catch (error) {
+      if (error instanceof AWSQueryError && error.code === "DryRunOperation") return identity;
+      throw error;
+    }
+    throw new AWSLeaseAuthorityError(
+      "AWS StopInstances permission check did not return DryRunOperation",
+    );
+  }
+
+  private async stopRetainedServerWith(
+    instanceID: string,
+    leaseID: string,
+    identity: string,
+    assertOwner: () => Promise<void>,
+    options: AWSQueryOptions,
+  ): Promise<void> {
+    if ((await this.retainedServerIdentityWith(instanceID, leaseID, options)) !== identity) {
+      throw new AWSLeaseAuthorityError("retained root disk changed before stop dispatch");
+    }
+    await assertOwner();
+    const stopped = await this.ec2("StopInstances", { "InstanceId.1": instanceID }, options);
+    const ids = items(record(stopped["instancesSet"])["item"]).map((item) =>
+      asString(record(item)["instanceId"]),
+    );
+    if (ids.length !== 1 || ids[0] !== instanceID) {
+      throw new AWSLeaseObservationError(
+        `AWS StopInstances did not confirm instance ${instanceID}`,
+      );
+    }
   }
 
   async terminateServerAndWait(instanceID: string): Promise<void> {
@@ -2708,7 +3121,32 @@ export class EC2SpotClient {
     const labels = leaseProviderLabels(launchConfig, leaseID, slug, owner, "aws", now, {
       market: config.capacityMarket,
     });
-    const rootGB = config.awsRootGB || positiveInt(this.env.CRABBOX_AWS_ROOT_GB) || 400;
+    let rootGB = config.awsRootGB || positiveInt(this.env.CRABBOX_AWS_ROOT_GB);
+    let rootDevice = "/dev/sda1";
+    if (!rootGB) {
+      const root = await this.ec2("DescribeImages", { "ImageId.1": imageID });
+      const images = items(record(root["imagesSet"])["item"]).map(record);
+      if (images.length === 0 && Object.hasOwn(root, "imagesSet")) {
+        throw new AWSImageNotFoundError(
+          `resolve AWS root disk minimum: AMI ${imageID} not found in ${this.region}`,
+        );
+      }
+      if (images.length !== 1) {
+        throw new Error(`resolve AWS root disk minimum: expected one AMI ${imageID}`);
+      }
+      const image = images[0]!;
+      rootDevice = asString(image["rootDeviceName"]);
+      const mapping = items(record(image["blockDeviceMapping"])["item"])
+        .map(record)
+        .find((item) => asString(item["deviceName"]) === rootDevice);
+      const minimum = positiveInt(asString(record(mapping?.["ebs"])["volumeSize"]));
+      if (!rootDevice || !minimum) {
+        throw new Error(
+          `resolve AWS root disk minimum: AMI ${imageID} has no root EBS volume size`,
+        );
+      }
+      rootGB = Math.max(defaultRootGB(config.class), minimum);
+    }
     const instanceProfile = config.awsProfile || this.env.CRABBOX_AWS_INSTANCE_PROFILE || "";
     const subnetID = config.awsSubnetID || this.env.CRABBOX_AWS_SUBNET_ID || "";
     const configuredMacHostID =
@@ -2740,6 +3178,7 @@ export class EC2SpotClient {
         }),
       );
       applyAWSRunInstanceTargetOptions(params, config);
+      params["BlockDeviceMapping.1.DeviceName"] = rootDevice;
       if (config.target === "macos") {
         const hostID =
           macHostID ||
@@ -2777,6 +3216,11 @@ export class EC2SpotClient {
       if (!machine.cloudID.trim()) {
         throw new Error(`${awsRunInstancesOutcomeUncertain}: aws returned no instance id`);
       }
+      if (config.capacityRequirements && machine.serverType !== config.serverType) {
+        throw new Error(
+          `${awsRunInstancesOutcomeUncertain}: returned instance type does not match the resource-qualified request`,
+        );
+      }
       return {
         ...machine,
         creationEvents: [requested, responded, ...observedRunning(machine.status)],
@@ -2807,7 +3251,9 @@ export class EC2SpotClient {
       return config.awsAMI || this.env.CRABBOX_AWS_AMI || "";
     }
     if (config.target === "windows") {
-      return this.resolveLatestAmazonAMI("Windows_Server-2022-English-Full-Base-*", "x86_64");
+      const os = osImageSpec(config.os);
+      const windows = os.target === "windows" ? os : osImageSpec("windows-server:2025");
+      return this.resolveLatestAmazonAMI(windows.awsName, "x86_64");
     }
     if (config.target === "macos") {
       const query = awsMacOSAMIQuery(config.serverType);
@@ -2820,7 +3266,7 @@ export class EC2SpotClient {
       awsUbuntuOwner,
       name,
       architecture,
-      `no ${os.awsLabel} ${architecture} AMI found in ${this.region}`,
+      `no AWS AMI found in ${this.region} for ${os.awsLabel} architecture=${architecture}`,
     );
   }
 
@@ -3383,7 +3829,9 @@ export class EC2SpotClient {
     );
     const text = await response.text();
     if (!response.ok) {
-      throw this.awsQueryError(action, response.status, text);
+      const error = this.awsQueryError(action, response.status, text);
+      error.retryAfter = response.headers.get("Retry-After") ?? undefined;
+      throw error;
     }
     let parsed: unknown;
     try {
@@ -3433,7 +3881,9 @@ export class EC2SpotClient {
     });
     const text = await response.text();
     if (!response.ok) {
-      throw this.awsQueryError(action, response.status, text);
+      const error = this.awsQueryError(action, response.status, text);
+      error.retryAfter = response.headers.get("Retry-After") ?? undefined;
+      throw error;
     }
     const parsed = this.parser.parse(text) as unknown;
     const parsedRecord = record(parsed);
@@ -3593,6 +4043,9 @@ export function awsLeaseImageIdentity(
   imageID: string,
   region: string,
 ): LeaseImageIdentity {
+  if (config.awsUseStockImage) {
+    return { id: imageID, source: "stock", provider: "aws", kind: "aws-ami", region };
+  }
   if (config.awsSnapshot) {
     return {
       id: imageID,
@@ -3603,7 +4056,7 @@ export function awsLeaseImageIdentity(
       sourceID: config.awsSnapshot,
     };
   }
-  if (config.selectedImage?.id === imageID) {
+  if (config.selectedImage?.id === imageID && config.selectedImage.region === region) {
     const { revision, ...selected } = config.selectedImage;
     return {
       ...selected,
@@ -3611,11 +4064,16 @@ export function awsLeaseImageIdentity(
       ...(selected.region === region && revision ? { revision } : {}),
     };
   }
-  if (Object.values(config.awsPromotedAMIs).includes(imageID)) {
+  if (config.awsPromotedAMIs[awsPromotedAMIConfigKey(region, config.serverType)] === imageID) {
     return { id: imageID, source: "promoted", provider: "aws", kind: "aws-ami", region };
   }
   const explicitImageID = config.awsAMI;
-  if (explicitImageID && !config.awsUseStockImage && explicitImageID === imageID) {
+  if (
+    explicitImageID &&
+    !config.awsUseStockImage &&
+    explicitImageID === imageID &&
+    config.selectedImage?.source !== "promoted"
+  ) {
     return { id: imageID, source: "explicit", provider: "aws", kind: "aws-ami", region };
   }
   return { id: imageID, source: "stock", provider: "aws", kind: "aws-ami", region };
@@ -3665,6 +4123,15 @@ function instanceToMachine(input: unknown): ProviderMachine {
     cloudID,
     name: tags["Name"] || cloudID,
     status: asString(record(instance["instanceState"])["name"]),
+    ...(asString(instance["spotInstanceRequestId"])
+      ? { awsSpotInstanceRequestID: asString(instance["spotInstanceRequestId"]) }
+      : {}),
+    ...(asString(record(instance["stateReason"])["code"])
+      ? { awsStateReasonCode: asString(record(instance["stateReason"])["code"]) }
+      : {}),
+    ...(asString(record(instance["stateReason"])["message"])
+      ? { awsStateReasonMessage: asString(record(instance["stateReason"])["message"]) }
+      : {}),
     serverType: asString(instance["instanceType"]),
     hostID: asString(record(instance["placement"])["hostId"]),
     host: asString(instance["ipAddress"]),
@@ -4142,8 +4609,8 @@ export function awsRegionCandidates(
     ]);
   }
   return validAWSRegionCandidates([
-    preferredRegion,
     config.awsRegion,
+    preferredRegion,
     env.CRABBOX_AWS_REGION ?? "",
     ...splitCommaList(env.CRABBOX_CAPACITY_REGIONS ?? ""),
     ...config.capacityRegions,
@@ -4328,11 +4795,14 @@ export function awsCapacityReadinessCheckForQuota(
       details,
     };
   }
-  details["hint"] = "quota_satisfies_default_class";
+  details["capacity"] = "unknown";
+  details["quota_limit"] = "sufficient";
+  details["usage"] = "unchecked";
+  details["hint"] = "check_regional_quota_usage";
   return {
     status: "ok",
     check: "capacity",
-    message: awsCapacityReadinessMessage("provider=aws capacity=ready", details),
+    message: awsCapacityReadinessMessage("provider=aws", details),
     details,
   };
 }
@@ -4584,5 +5054,5 @@ function conciseAWSMacHostDryRunMessage(message: string): string {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return providerSleep(ms, providerRequestSignal(ms + 1_000, undefined, "aws", "poll wait"));
 }

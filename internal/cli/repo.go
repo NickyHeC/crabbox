@@ -471,6 +471,7 @@ func cleanRemoteRepoName(name string) string {
 func defaultExcludes() []string {
 	excludes := []string{
 		".git",
+		".jj",
 		"._*",
 		"node_modules",
 		".ignored",
@@ -952,6 +953,7 @@ func syncFingerprintPathsAndSize(ctx context.Context, h hash.Hash, root string, 
 }
 
 type SyncManifest struct {
+	seededExtraFiles         []string
 	hasSpecialFiles          bool
 	Files                    []string
 	Deleted                  []string
@@ -996,7 +998,7 @@ func gitSyncFileList(root string) ([]byte, error) {
 			return nil, err
 		}
 		if boundary.kind == repositoryBoundaryNativeJujutsu {
-			return nil, fmt.Errorf("%s is a native Jujutsu workspace without colocated Git metadata: Crabbox sync is Git-manifest-based, and native Jujutsu sync is not supported yet because it risks syncing the wrong revision; use a colocated Git workspace instead (for example, from an existing Git checkout, initialize Jujutsu with `jj git init --git-repo=.`; this does not convert the current native workspace in place), or pass --no-sync to run without syncing local files", boundary.root)
+			return nil, fmt.Errorf("%s is a native Jujutsu workspace: use `crabbox sync-plan` or `crabbox run` with jj installed to prepare the exact @ tree before Git manifest enumeration, or pass --no-sync", boundary.root)
 		}
 	}
 	cmd := exec.Command("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
@@ -1148,6 +1150,9 @@ func projectSyncManifest(root string, excludes SyncExcludeRules, includes, paths
 		seen[rel] = true
 		manifest.Files = append(manifest.Files, rel)
 		manifest.Bytes += info.Size()
+		if info.Mode().IsRegular() && (info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 || info.Mode().Perm() != 0o644 && info.Mode().Perm() != 0o755) {
+			manifest.seededExtraFiles = append(manifest.seededExtraFiles, rel)
+		}
 		manifest.hasSpecialFiles = manifest.hasSpecialFiles || (!info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0)
 		if protectedPattern != "" {
 			manifest.ProtectedTrackedExcludes = append(manifest.ProtectedTrackedExcludes, SyncProtectedTrackedExclude{

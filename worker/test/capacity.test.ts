@@ -14,7 +14,7 @@ import { FleetCoordinator, FleetDurableObject } from "../src/fleet";
 import { orgKeyForLabel } from "../src/org-identity";
 import type { Env, LeaseRecord } from "../src/types";
 import {
-  activeLeaseLimitForOwner,
+  activeLeaseLimitsForOwner,
   costLimits,
   enforceCostLimitUsage,
   type CostLimitUsage,
@@ -117,9 +117,9 @@ function lease(id: string, overrides: Partial<LeaseRecord> = {}): LeaseRecord {
     estimatedHourlyUSD: 1,
     maxEstimatedUSD: 1,
     state: "active",
-    createdAt: "2026-09-01T00:00:00Z",
+    createdAt: "2026-09-02T11:30:00Z",
     updatedAt: now.toISOString(),
-    expiresAt: "2026-09-03T00:00:00Z",
+    expiresAt: "2026-09-02T12:30:00Z",
     ...overrides,
   };
 }
@@ -294,6 +294,10 @@ for (const kind of ["cloudflare", "node"] as const) {
         activeLeases: 1,
         effectiveLimit: 10,
         observedAt: now.toISOString(),
+        fleet: { activeLeases: 1, limit: null },
+        org: { key: "org-a", activeLeases: 1, limit: null },
+        admissible: true,
+        blockedBy: null,
       });
       expect(f.storage.values).toEqual(before);
       f.readonly();
@@ -328,6 +332,10 @@ for (const kind of ["cloudflare", "node"] as const) {
         activeLeases: 3,
         effectiveLimit: 10,
         observedAt: now.toISOString(),
+        fleet: { activeLeases: 5, limit: null },
+        org: { key: "org-a", activeLeases: 4, limit: null },
+        admissible: true,
+        blockedBy: null,
       });
       f.readonly();
     });
@@ -349,6 +357,141 @@ for (const kind of ["cloudflare", "node"] as const) {
         );
       },
     );
+
+    it.each([
+      { name: "fleet with owner headroom", fleet: 2, owner: 10, org: 10, blockedBy: "fleet" },
+      { name: "org with owner headroom", fleet: 10, owner: 10, org: 2, blockedBy: "org" },
+      { name: "owner", fleet: 10, owner: 1, org: 10, blockedBy: "owner" },
+      { name: "fleet before owner and org", fleet: 3, owner: 1, org: 2, blockedBy: "fleet" },
+      { name: "owner before org", fleet: 10, owner: 1, org: 2, blockedBy: "owner" },
+      { name: "headroom", fleet: 4, owner: 2, org: 3, blockedBy: null },
+      { name: "unlimited", fleet: 0, owner: 0, org: 0, blockedBy: null },
+    ])("reports $name using the allocation limit order", async (test) => {
+      const f = await fixture(kind, {
+        CRABBOX_MAX_ACTIVE_LEASES: String(test.fleet),
+        CRABBOX_MAX_ACTIVE_LEASES_PER_OWNER: String(test.owner),
+        CRABBOX_MAX_ACTIVE_LEASES_PER_ORG: String(test.org),
+      });
+      f.seed(lease("self"));
+      f.seed(lease("same-org", { owner: "github:99999" }), "provider-access:");
+      f.seed(lease("other-org", { owner: "github:88888", org: orgKeyForLabel("org-b") }));
+      const response = await f.fetch();
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        owner,
+        activeLeases: 1,
+        effectiveLimit: test.owner,
+        observedAt: now.toISOString(),
+        fleet: { activeLeases: 3, limit: test.fleet || null },
+        org: { key: "org-a", activeLeases: 2, limit: test.org || null },
+        admissible: test.blockedBy === null,
+        blockedBy: test.blockedBy,
+      });
+      f.readonly();
+      const { costUsage } = await f.runtime.runExclusive(() =>
+        admission(f.fleet).leaseAdmissionState({ owner, org }, now),
+      );
+      const messages = {
+        fleet: `fleet active lease limit exceeded: 4/${test.fleet}`,
+        owner: `active lease limit for owner exceeded: 2/${test.owner}`,
+        org: `active lease limit for org exceeded: 3/${test.org}`,
+      };
+      expect(enforceCostLimitUsage(costUsage, lease("candidate"), costLimits(f.env))).toBe(
+        test.blockedBy === null ? "" : messages[test.blockedBy as keyof typeof messages],
+      );
+    });
+
+    it.each([
+      {
+        name: "eligible deployment admin",
+        admin: owner,
+        override: owner,
+        adminLimit: "50",
+        self: 11,
+        shared: true,
+        blockedBy: null,
+      },
+      {
+        name: "eligible normalized legacy admin",
+        admin: "",
+        legacy: ` ${owner.toUpperCase()} `,
+        override: ` ${owner.toUpperCase()} `,
+        adminLimit: "50",
+        self: 11,
+        shared: true,
+        blockedBy: null,
+      },
+      {
+        name: "legacy admin only",
+        admin: "",
+        legacy: owner,
+        override: "",
+        adminLimit: "50",
+        self: 11,
+        shared: false,
+        blockedBy: "fleet",
+      },
+      {
+        name: "override only",
+        admin: "",
+        override: owner,
+        adminLimit: "50",
+        self: 11,
+        shared: false,
+        blockedBy: "fleet",
+      },
+      {
+        name: "ordinary owner",
+        admin: "github:99999",
+        override: "github:99999",
+        adminLimit: "50",
+        self: 11,
+        shared: false,
+        blockedBy: "fleet",
+      },
+      {
+        name: "disabled admin limit",
+        admin: owner,
+        override: owner,
+        adminLimit: "0",
+        self: 11,
+        shared: false,
+        blockedBy: "fleet",
+      },
+      {
+        name: "owner allowance exhausted",
+        admin: owner,
+        override: owner,
+        adminLimit: "50",
+        self: 50,
+        shared: true,
+        blockedBy: "owner",
+      },
+    ])("reports shared override for $name without hiding aggregate usage", async (test) => {
+      const f = await fixture(kind, {
+        CRABBOX_DEPLOYMENT_CAPACITY_ADMIN_OWNERS: test.admin,
+        CRABBOX_CAPACITY_ADMIN_OWNERS: test.legacy,
+        CRABBOX_SHARED_CAPACITY_OVERRIDE_OWNERS: test.override,
+        CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN: test.adminLimit,
+        CRABBOX_MAX_ACTIVE_LEASES: "50",
+        CRABBOX_MAX_ACTIVE_LEASES_PER_ORG: "50",
+      });
+      for (let i = 0; i < 50; i++)
+        f.seed(lease(`shared-${i}`, { owner: i < test.self ? owner : "github:99999" }));
+      const response = await f.fetch();
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        owner,
+        activeLeases: test.self,
+        effectiveLimit: test.adminLimit !== "0" && (test.admin === owner || test.legacy) ? 50 : 10,
+        observedAt: now.toISOString(),
+        fleet: { activeLeases: 50, limit: test.shared ? null : 50 },
+        org: { key: "org-a", activeLeases: 50, limit: test.shared ? null : 50 },
+        admissible: test.blockedBy === null,
+        blockedBy: test.blockedBy,
+      });
+      f.readonly();
+    });
 
     it("uses live reservations once with precedence and ignores stale entries without deleting", async () => {
       const f = await fixture(kind);
@@ -486,6 +629,10 @@ for (const kind of ["cloudflare", "node"] as const) {
         activeLeases: 1,
         effectiveLimit: 10,
         observedAt: now.toISOString(),
+        fleet: { activeLeases: 2, limit: null },
+        org: { key: "org-a", activeLeases: 2, limit: null },
+        admissible: true,
+        blockedBy: null,
       });
       f.readonly();
     });
@@ -512,6 +659,10 @@ for (const kind of ["cloudflare", "node"] as const) {
         activeLeases: 1,
         effectiveLimit: 10,
         observedAt: now.toISOString(),
+        fleet: { activeLeases: 2, limit: null },
+        org: { key: "org-a", activeLeases: 2, limit: null },
+        admissible: true,
+        blockedBy: null,
       });
       f.readonly();
     });
@@ -550,6 +701,30 @@ for (const kind of ["cloudflare", "node"] as const) {
 }
 
 describe("owner capacity limit policy", () => {
+  it("reports deployment capacity membership through the authenticated Fleet route", async () => {
+    const f = await fixture("cloudflare", {
+      CRABBOX_DEPLOYMENT_CAPACITY_ADMIN_OWNERS: ` ${owner.toUpperCase()} `,
+      CRABBOX_CAPACITY_ADMIN_OWNERS: "github:99999",
+      CRABBOX_MAX_ACTIVE_LEASES_PER_CAPACITY_ADMIN: "50",
+      CRABBOX_MAX_ACTIVE_LEASES: "50",
+      CRABBOX_MAX_ACTIVE_LEASES_PER_ORG: "50",
+    });
+    for (let index = 0; index < 10; index++) f.seed(lease(`existing-${index}`));
+    const response = await f.fetch();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      owner,
+      activeLeases: 10,
+      effectiveLimit: 50,
+      observedAt: now.toISOString(),
+      fleet: { activeLeases: 10, limit: 50 },
+      org: { key: "org-a", activeLeases: 10, limit: 50 },
+      admissible: true,
+      blockedBy: null,
+    });
+    f.readonly();
+  });
+
   it.each([
     [10, 20, true, 20],
     [10, 5, true, 10],
@@ -569,7 +744,9 @@ describe("owner capacity limit policy", () => {
       });
       f.seed(lease("exact", { owner: "Alice@Example.com" }));
       f.seed(lease("different-case", { owner: "alice@example.com" }));
-      expect(activeLeaseLimitForOwner(costLimits(f.env), "Alice@Example.com")).toBe(expected);
+      expect(activeLeaseLimitsForOwner(costLimits(f.env), "Alice@Example.com").owner).toBe(
+        expected,
+      );
       expect(await (await f.fetch()).json()).toMatchObject({
         owner: "Alice@Example.com",
         activeLeases: 1,

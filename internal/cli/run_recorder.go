@@ -17,7 +17,13 @@ const (
 	runRecorderFinishTimeout   = 60 * time.Second
 	runRecorderFinishAttempts  = 3
 	runRecorderFinishRetry     = 250 * time.Millisecond
+	// Leave recovery time after a saturated coordinator's per-request timeout.
+	runAdmissionBudget   = 30 * time.Second
+	runAdmissionAttempts = 4
 )
+
+// Production backoff honors Retry-After; sequential tests may stub it to avoid real sleeps.
+var runAdmissionRetryDelay = coordinatorReadBackoff
 
 type runRecorder struct {
 	coord              *CoordinatorClient
@@ -98,6 +104,7 @@ func (r *runRecorder) createRun(ctx context.Context, leaseID string, cfg Config)
 			TokenCommand:     append([]string(nil), r.coord.TokenCommand...),
 			ChildEnvDenylist: append([]string(nil), r.coord.ChildEnvDenylist...),
 			Client:           r.coord.Client,
+			readRetryWriter:  r.stderr,
 			admissionAuth:    &coordinatorAdmissionAuth{},
 		}
 		r.createBaseURL = strings.TrimRight(r.coord.BaseURL, "/")
@@ -160,7 +167,7 @@ func (r *runRecorder) appendEvent(kind string, input CoordinatorRunEventInput) {
 		r.publisher = newRunEventPublisher(r.handleRunEventAppendError)
 	}
 	if r.finished {
-		if err := postRunEvent(context.Background(), r.coord, r.runID, input); err != nil {
+		if err := r.publisher.postEvent(context.Background(), r.coord, r.runID, input); err != nil {
 			r.handleRunEventAppendError(kind, err)
 		}
 		return
@@ -270,6 +277,7 @@ func (r *runRecorder) attachRun(run CoordinatorRun) {
 	r.createPending = false
 	r.historyUnavailable = false
 	r.publisher = newRunEventPublisher(r.handleRunEventAppendError)
+	r.publisher.idempotent = run.EventAppendIdempotent
 	fmt.Fprintf(r.stderr, "recording run %s\n", run.ID)
 }
 
@@ -285,8 +293,13 @@ func (r *runRecorder) Finish(ctx context.Context, target SSHTarget, exitCode int
 		return nil
 	}
 	r.terminalAttempted = true
-	r.waitForEvents(runEventOutputPostWait)
+	eventsDrained := make(chan struct{})
+	go func() {
+		r.waitForEvents(r.publisher.drainTimeout())
+		close(eventsDrained)
+	}()
 	r.CaptureTelemetryEnd(ctx, target)
+	<-eventsDrained
 	telemetry := runTelemetrySummary(r.telemetryStart, r.telemetryEnd, r.telemetrySnapshot())
 	ctx, cancel := context.WithTimeout(context.Background(), runRecorderFinishTimeout)
 	defer cancel()
@@ -352,7 +365,7 @@ func (r *runRecorder) Failed(err error) {
 	if r == nil {
 		return
 	}
-	r.waitForEvents(runEventOutputPostWait)
+	r.waitForEvents(r.publisher.drainTimeout())
 	r.stopTelemetrySampler()
 	if r.finished || err == nil || r.terminalAttempted {
 		return

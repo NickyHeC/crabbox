@@ -636,7 +636,7 @@ case "$remote" in
     if [ ! -e "$CRABBOX_FAKE_SSH_MKDIR_COMMAND" ]; then
       printf '%s\n' "$remote" > "$CRABBOX_FAKE_SSH_MKDIR_COMMAND"
     fi
-    IFS= read -r mkdir_command < "$CRABBOX_FAKE_SSH_MKDIR_COMMAND"
+    mkdir_command=$(/bin/cat "$CRABBOX_FAKE_SSH_MKDIR_COMMAND")
     if [ "$remote" = "$mkdir_command" ]; then
       printf 'call\n' >> "$CRABBOX_FAKE_SSH_MKDIR_CALLS"
       if [ ! -e "$CRABBOX_FAKE_SSH_FIRST_MKDIR" ]; then
@@ -1152,7 +1152,7 @@ func TestRunDelegatedArchiveSyncValidatesSourceBeforeProviderCall(t *testing.T) 
 		if !AsExitError(err, &exitErr) || exitErr.Code != 6 {
 			t.Fatalf("error=%v, want exit 6\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 		}
-		for _, want := range []string{root, "native Jujutsu workspace", "Git-manifest-based", "wrong revision", "colocated Git workspace", "jj git init --git-repo=.", "--no-sync"} {
+		for _, want := range []string{root, "native Jujutsu workspace", "install jj", "--no-sync"} {
 			if !strings.Contains(exitErr.Message, want) {
 				t.Fatalf("message missing %q: %q", want, exitErr.Message)
 			}
@@ -1237,7 +1237,7 @@ func TestRunDelegatedArchiveSyncValidatesSourceBeforeProviderCall(t *testing.T) 
 func runWorkdirCases() []runWorkdirCase {
 	return []runWorkdirCase{
 		{name: "ordinary non-Git", diagnostic: "not a Git repository", guidance: []string{"git init", "--no-sync"}},
-		{name: "native Jujutsu", native: true, diagnostic: "native Jujutsu workspace", guidance: []string{"Git-manifest-based", "wrong revision", "colocated Git workspace", "jj git init --git-repo=.", "--no-sync"}},
+		{name: "native Jujutsu", native: true, diagnostic: "native Jujutsu workspace", guidance: []string{"install jj", "--no-sync"}},
 	}
 }
 
@@ -2786,6 +2786,7 @@ exit 0
 				testAWSBackendOverride = nil
 				RemoveLeaseClaim(leaseID)
 			})
+			disableRunAdmissionBackoff(t)
 
 			var stdout, stderr bytes.Buffer
 			err := (App{Stdout: &stdout, Stderr: &stderr}).runCommand(t.Context(), []string{
@@ -2798,7 +2799,7 @@ exit 0
 			})
 			wantCalls := int32(1)
 			if tc.createRunFail {
-				wantCalls = 2
+				wantCalls = runAdmissionAttempts
 			}
 			if calls := createRunCalls.Load(); calls != wantCalls {
 				t.Fatalf("create run calls=%d, wrong bounded count; error=%v\nstdout=%s\nstderr=%s", calls, err, stdout.String(), stderr.String())
@@ -8703,7 +8704,7 @@ exec ` + shellQuote(realTar) + ` "$@"
 	}
 	lines := strings.Split(strings.TrimSpace(string(dfCalls)), "\n")
 	if len(lines) != 4 ||
-		!strings.Contains(lines[0], tempRoot) || lines[2] != lines[0] ||
+		!strings.HasPrefix(lines[0], "-Pk .crabbox/crabbox-failure-capture.") || lines[2] != lines[0] ||
 		lines[1] != "-Pk .crabbox" || lines[3] != lines[1] {
 		t.Fatalf("disk admission calls=%q", lines)
 	}
@@ -8715,6 +8716,43 @@ exec ` + shellQuote(realTar) + ` "$@"
 	}
 	if entries, err := os.ReadDir(tempRoot); err != nil || len(entries) != 0 {
 		t.Fatalf("failure capture scratch retained: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestRemoteFailureCaptureUsesOutputDiskWhenTempIsSmall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX capture command")
+	}
+	workdir, tempRoot, binDir := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// Tiny Linux guests can have a small /tmp tmpfs despite ample workspace disk.
+	dfScript := `#!/bin/sh
+available=9999999
+case "$2" in "$TMPDIR"/*) available=1000000 ;; esac
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'fake 9999999 0 %s 0%% /\n' "$available"
+`
+	if err := os.WriteFile(filepath.Join(binDir, "df"), []byte(dfScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "failure.log"), []byte("synthetic failure evidence"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := remoteFailureCaptureCommand(workdir, ".crabbox/capture.tar.gz", "")
+	command = strings.Replace(command, "bash -lc ", "bash --noprofile --norc -c ", 1)
+	if out, err := exec.Command("/bin/sh", "-c", command).CombinedOutput(); err != nil {
+		t.Fatalf("capture with ample output disk failed: %v\n%s", err, out)
+	}
+	archive := filepath.Join(workdir, ".crabbox", "capture.tar.gz")
+	if got := string(readTarGzContents(t, archive)["failure.log"]); got != "synthetic failure evidence" {
+		t.Fatalf("captured log=%q", got)
+	}
+	if entries, err := os.ReadDir(filepath.Join(workdir, ".crabbox")); err != nil || len(entries) != 1 || entries[0].Name() != "capture.tar.gz" {
+		t.Fatalf("capture scratch retained beside output: entries=%v err=%v", entries, err)
+	}
+	if entries, err := os.ReadDir(tempRoot); err != nil || len(entries) != 0 {
+		t.Fatalf("capture scratch retained in temp: entries=%v err=%v", entries, err)
 	}
 }
 
@@ -8913,6 +8951,9 @@ func assertRemoteFailureCaptureFilesRemoved(t *testing.T, workdir, tempRoot stri
 	}
 	if entries, err := os.ReadDir(tempRoot); err != nil || len(entries) != 0 {
 		t.Fatalf("failure capture scratch retained: entries=%v err=%v", entries, err)
+	}
+	if paths, err := filepath.Glob(filepath.Join(workdir, ".crabbox", "crabbox-failure-capture.*")); err != nil || len(paths) != 0 {
+		t.Fatalf("failure capture scratch retained beside output: paths=%v err=%v", paths, err)
 	}
 }
 
@@ -10285,6 +10326,128 @@ func TestApplyResolvedLeaseConfigPrefersStoredLabelsAndUpdatesTarget(t *testing.
 	}
 }
 
+func TestApplyResolvedLeaseConfigRefreshesProviderReadinessForRecordedPlatform(t *testing.T) {
+	linuxGate := func(t *testing.T, readyCheck string) {
+		t.Helper()
+		if !strings.Contains(readyCheck, "cloud-init status --wait") {
+			t.Fatalf("ready check=%q, want the provider Linux bootstrap gate", readyCheck)
+		}
+	}
+	for _, test := range []struct {
+		name            string
+		configTargetOS  string
+		configMode      string
+		labels          map[string]string
+		wantReadyCheck  func(*testing.T, string)
+		wantProbeNative bool
+	}{
+		{
+			name:           "Linux defaults resolve a native Windows lease",
+			configTargetOS: targetLinux,
+			labels:         map[string]string{"target": targetWindows, "windows_mode": windowsModeNormal},
+			wantReadyCheck: func(t *testing.T, readyCheck string) {
+				t.Helper()
+				if readyCheck != "" {
+					t.Fatalf("ready check=%q, want the platform default for native Windows", readyCheck)
+				}
+			},
+			wantProbeNative: true,
+		},
+		{
+			name:           "Linux defaults resolve a WSL2 lease",
+			configTargetOS: targetLinux,
+			labels:         map[string]string{"target": targetWindows, "windows_mode": windowsModeWSL2},
+			wantReadyCheck: func(t *testing.T, readyCheck string) {
+				t.Helper()
+				if readyCheck != "" {
+					t.Fatalf("ready check=%q, want the platform default for WSL2", readyCheck)
+				}
+			},
+		},
+		{
+			name:           "Linux defaults resolve a Linux lease",
+			configTargetOS: targetLinux,
+			labels:         map[string]string{"target": targetLinux},
+			wantReadyCheck: linuxGate,
+		},
+		{
+			name:           "Windows defaults resolve a Linux lease",
+			configTargetOS: targetWindows,
+			configMode:     windowsModeNormal,
+			labels:         map[string]string{"target": targetLinux},
+			wantReadyCheck: linuxGate,
+		},
+		{
+			name:           "Linux defaults resolve a macOS lease",
+			configTargetOS: targetLinux,
+			labels:         map[string]string{"target": targetMacOS},
+			wantReadyCheck: func(t *testing.T, readyCheck string) {
+				t.Helper()
+				if readyCheck != "" {
+					t.Fatalf("ready check=%q, want the platform default for macOS", readyCheck)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.Provider = "aws"
+			cfg.TargetOS = test.configTargetOS
+			cfg.WindowsMode = test.configMode
+			normalizeTargetConfig(&cfg)
+			target := sshTargetForLease(cfg, "203.0.113.5", "", "")
+			if test.configTargetOS == targetLinux {
+				linuxGate(t, target.ReadyCheck)
+			} else if target.ReadyCheck != "" {
+				t.Fatalf("initial ready check=%q, want platform default", target.ReadyCheck)
+			}
+
+			applyResolvedLeaseConfig(&cfg, Server{Labels: test.labels}, &target)
+
+			if target.TargetOS != test.labels["target"] {
+				t.Fatalf("resolved target=%#v, want platform from lease labels", target)
+			}
+			test.wantReadyCheck(t, target.ReadyCheck)
+			command := sshReadyCommand(target)
+			if strings.Contains(command, "cloud-init") && test.labels["target"] != targetLinux {
+				t.Fatalf("readiness command=%q still carries the Linux bootstrap gate", command)
+			}
+			if test.wantProbeNative && command != sshReadyCommand(SSHTarget{TargetOS: targetWindows, WindowsMode: windowsModeNormal}) {
+				t.Fatalf("readiness command=%q, want the native Windows readiness probe", command)
+			}
+		})
+	}
+}
+
+func TestApplyResolvedLeaseConfigKeepsCustomReadinessAcrossPlatformChange(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Provider = "aws"
+	target := sshTargetForLease(cfg, "203.0.113.5", "", "")
+	target.ReadyCheck = "test -f /opt/custom-ready"
+
+	applyResolvedLeaseConfig(&cfg, Server{Labels: map[string]string{"target": targetWindows, "windows_mode": windowsModeNormal}}, &target)
+
+	if target.TargetOS != targetWindows || target.ReadyCheck != "test -f /opt/custom-ready" {
+		t.Fatalf("resolved target=%#v, want the custom readiness command preserved", target)
+	}
+}
+
+func TestApplyResolvedLeaseConfigKeepsReadinessWhenPlatformUnchanged(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Provider = "aws"
+	target := sshTargetForLease(cfg, "203.0.113.5", "", "")
+	before := target.ReadyCheck
+	if !strings.Contains(before, "cloud-init status --wait") {
+		t.Fatalf("initial ready check=%q, want the provider Linux bootstrap gate", before)
+	}
+
+	applyResolvedLeaseConfig(&cfg, Server{Labels: map[string]string{"work_root": "/srv/crabbox"}}, &target)
+
+	if target.ReadyCheck != before || cfg.WorkRoot != "/srv/crabbox" {
+		t.Fatalf("resolved target=%#v config work root=%q, want unchanged readiness", target, cfg.WorkRoot)
+	}
+}
+
 func TestApplyResolvedLeaseConfigPreservesProviderTargetUser(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.Provider = "aws"
@@ -10631,4 +10794,29 @@ func TestRunClosesWorkspaceBeforeProviderRelease(t *testing.T) {
 	if n := strings.Count(string(data), "protocol_action='release'"); n != 1 {
 		t.Fatalf("workspace released %d times", n)
 	}
+}
+
+func writeDelegatedRunReceipt(path, keyPath string, cfg Config, result RunResult, req RunRequest) (runArtifact, error) {
+	key, err := resolveAttestKey(keyPath)
+	if err != nil {
+		return runArtifact{}, Exit(2, "attest key: %v", err)
+	}
+	prepared, err := prepareDelegatedRunReceipt(path, key, cfg, result, req)
+	if err != nil {
+		return runArtifact{}, err
+	}
+	return persistPreparedRunReceipt(prepared)
+}
+
+func runCommandShellString(command []string, shellMode bool) string {
+	return runCommandShellStringWithLiteralArgs(command, shellMode, nil)
+}
+
+func shouldUseShell(command []string) bool {
+	return shouldUseShellWithLiteralArgs(command, nil)
+}
+
+func releaseCoordinatorLease(ctx context.Context, coord *CoordinatorClient, leaseID, expectedProvider string) error {
+	_, err := releaseCoordinatorLeaseResult(ctx, coord, leaseID, expectedProvider)
+	return err
 }

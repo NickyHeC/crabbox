@@ -26,6 +26,7 @@ PROTECTED_HOMEBREW_TOOLING=(
   scripts/verify-go-release-binary.mjs
   scripts/verify-homebrew-release.sh
   scripts/verify-macos-binary.sh
+  scripts/verify-macos-notarization.mjs
   scripts/verify-release.sh
   scripts/verify-release-source.sh
 )
@@ -228,13 +229,20 @@ freeze_public_release() {
     cp "$asset_dir/$name" "$frozen/$name"
   done <"$expected_names"
 
-  public_api_get() {
+  # Hosted workflows fetch metadata in a separate read-only authenticated step.
+  # Only the response enters this verifier; validation below is identical.
+  if [[ -n "${CRABBOX_HOMEBREW_RELEASE_METADATA+x}" ]]; then
+    [[ -f "$CRABBOX_HOMEBREW_RELEASE_METADATA" && ! -L "$CRABBOX_HOMEBREW_RELEASE_METADATA" ]] || {
+      echo "public release metadata must be a regular file, not a symlink" >&2
+      return 1
+    }
+    cp "$CRABBOX_HOMEBREW_RELEASE_METADATA" "$work/public-release.json"
+  else
     curl --disable --fail --silent --show-error --location --retry 3 \
       --header 'Accept: application/vnd.github+json' \
       --header 'X-GitHub-Api-Version: 2026-03-10' \
-      "https://api.github.com/$1"
-  }
-  public_api_get "repos/$repository/releases/$release_id" >"$work/public-release.json"
+      "https://api.github.com/repos/$repository/releases/$release_id" >"$work/public-release.json"
+  fi
   env -i \
     CRABBOX_PUBLISH_REPOSITORY="$repository" \
     CRABBOX_PUBLISH_RELEASE_ID="$release_id" \
@@ -390,8 +398,9 @@ homebrew_phase() {
   local runtime_pack
   runtime_pack=$("$node_bin" -e '
     const p = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
-    if (![1, 2, 3].includes(p.schemaVersion)) throw new Error("unsupported release provenance schema");
-    process.stdout.write(p.schemaVersion === 3 ? "filesystem" : p.schemaVersion === 2 ? "true" : "false");
+    if (![1, 2, 3, 4].includes(p.schemaVersion)) throw new Error("unsupported release provenance schema");
+    // Schema 4 (egress) ships the same archive inventory as schema 3 (filesystem).
+    process.stdout.write(p.schemaVersion >= 3 ? "filesystem" : p.schemaVersion === 2 ? "true" : "false");
   ' "$asset_dir/provenance.json")
   local expected_members=crabbox
   [[ "$native_arch" == arm64 ]] && expected_members=$'crabbox\ncrabbox-apple-vm-helper'

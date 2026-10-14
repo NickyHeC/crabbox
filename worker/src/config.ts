@@ -1,7 +1,10 @@
 import { requireAWSRegion } from "./aws-region";
-import { normalizeImageRequirements } from "./image-capabilities";
+import { hasImageRequirements, normalizeImageRequirements } from "./image-capabilities";
+import { MISSING_ORG_KEY, orgLabelFromKey } from "./org-identity";
 import { normalizeOSImage, osImageSpec } from "./os-image";
 import type {
+  Env,
+  CapacityRequirements,
   ImageRequirements,
   LeaseImageIdentity,
   LeaseRequest,
@@ -25,6 +28,9 @@ export const awsMacOSInstanceTypeCandidates = [
 export const workspaceProviderKeyPrefix = "crabbox-workspace-";
 
 export interface LeaseConfig {
+  lifetimePolicy?: LeaseRequest["lifetimePolicy"];
+  policyNotice?: string;
+  leasePolicy?: LeasePolicy;
   provider: Provider;
   target: TargetOS;
   architecture: Architecture;
@@ -90,6 +96,7 @@ export interface LeaseConfig {
   gcpRootGB: number;
   gcpServiceAccount: string;
   capacityMarket: "spot" | "on-demand";
+  capacityRequirements?: CapacityRequirements;
   capacityStrategy:
     | "most-available"
     | "price-capacity-optimized"
@@ -117,7 +124,27 @@ export interface LeaseConfig {
 export type AzureOSDiskMode = "managed" | "ephemeral";
 export type Architecture = "amd64" | "arm64";
 
+export class InvalidCapacityRequirementsError extends Error {}
+
+export function normalizeCapacityRequirements(
+  input: CapacityRequirements | undefined,
+): CapacityRequirements | undefined {
+  const normalized: CapacityRequirements = {};
+  for (const name of ["minVCPUs", "minMemoryMiB"] as const) {
+    const value = input?.[name];
+    if (value === undefined) continue;
+    if (!Number.isInteger(value) || value < 0 || value > 2147483647) {
+      throw new InvalidCapacityRequirementsError(
+        `capacity.${name} must be an integer from 0 to 2147483647`,
+      );
+    }
+    if (value > 0) normalized[name] = value;
+  }
+  return Object.keys(normalized).length ? normalized : undefined;
+}
+
 export interface LeaseConfigDefaults {
+  leasePolicy?: LeasePolicy;
   azureOSDisk?: string;
   azureImage?: string;
   azureWindowsARM64Image?: string;
@@ -127,6 +154,8 @@ export interface LeaseConfigDefaults {
 const maxRequestedPondNameLength = 41;
 const maxExposedPort = 65_535;
 const maxExposedPortsPerLease = 10;
+
+export class InvalidAWSImageSourceError extends Error {}
 
 export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults = {}): LeaseConfig {
   const provider = input.provider ?? "hetzner";
@@ -139,11 +168,37 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
   ) {
     throw new Error(`unsupported provider: ${String(provider)}`);
   }
+  if (input.awsUseStockImage !== undefined && typeof input.awsUseStockImage !== "boolean") {
+    throw new InvalidAWSImageSourceError("awsUseStockImage must be a boolean");
+  }
+  const awsUseStockImage = input.awsUseStockImage ?? false;
+  const imageRequirements = normalizeImageRequirements(input.imageRequirements);
+  if (awsUseStockImage) {
+    if (provider !== "aws") {
+      throw new InvalidAWSImageSourceError("awsUseStockImage requires provider=aws");
+    }
+    if (input.awsAMI || input.awsSnapshot) {
+      throw new InvalidAWSImageSourceError(
+        "awsUseStockImage cannot be combined with awsAMI or awsSnapshot",
+      );
+    }
+    if (hasImageRequirements(imageRequirements)) {
+      throw new InvalidAWSImageSourceError(
+        "awsUseStockImage cannot be combined with image capability requirements",
+      );
+    }
+  }
   const target = normalizeTarget(input.target ?? input.targetOS ?? "linux");
   const requestedArchitecture = normalizeArchitecture(input.architecture);
   const architectureExplicit = Boolean(input.architecture?.trim());
   const os = normalizeOSImage(input.os);
   const osExplicit = Boolean(input.os?.trim());
+  const selectedOS = osImageSpec(os);
+  if (selectedOS.provider && (provider !== selectedOS.provider || target !== selectedOS.target)) {
+    throw new Error(
+      `os ${os} requires provider=${selectedOS.provider} target=${selectedOS.target}`,
+    );
+  }
   const linuxOSImage = target === "linux" ? osImageSpec(os) : undefined;
   const windowsMode = normalizeWindowsMode(input.windowsMode ?? "normal");
   const architecture = architectureExplicit
@@ -269,13 +324,19 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
       serverType,
     );
   }
-  const ttlSeconds = clampTTL(input.ttlSeconds ?? 5400);
-  const idleTimeoutSeconds = clampIdleTimeout(input.idleTimeoutSeconds ?? 1800);
+  const policy = defaults.leasePolicy ?? resolveLeasePolicy({});
+  const { ttlSeconds, idleTimeoutSeconds, policyNotice } = clampLeaseDurations(input, policy);
   const awsSSHCIDRs =
     provider === "aws"
       ? validatedCIDRs(input.awsSSHCIDRs ?? [], "awsSSHCIDRs")
       : validCIDRs(input.awsSSHCIDRs ?? []);
   const awsInstanceTypes = validatedAWSInstanceTypes(input.awsInstanceTypes ?? []);
+  const capacityRequirements = normalizeCapacityRequirements(input.capacity);
+  if (capacityRequirements && (provider !== "aws" || target !== "linux")) {
+    throw new InvalidCapacityRequirementsError(
+      "capacity minimums currently require provider=aws and target=linux",
+    );
+  }
   const awsPrivate = input.awsPrivate ?? false;
   const awsRequireSSM = input.awsRequireSSM ?? false;
   if ((awsPrivate || awsRequireSSM || awsInstanceTypes.length > 0) && provider !== "aws") {
@@ -313,6 +374,7 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
         )
       : (input.capacity?.regions ?? []);
   return {
+    ...(input.lifetimePolicy ? { lifetimePolicy: input.lifetimePolicy } : {}),
     provider,
     target,
     architecture,
@@ -321,7 +383,7 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
     desktop: input.desktop ?? false,
     desktopEnv,
     browser: input.browser ?? false,
-    imageRequirements: normalizeImageRequirements(input.imageRequirements),
+    imageRequirements,
     code: input.code ?? false,
     tailscale: input.tailscale ?? false,
     tailscaleTags: normalizeTailscaleTags(input.tailscaleTags ?? ["tag:crabbox"]),
@@ -341,14 +403,14 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
     image: input.image ?? linuxOSImage?.hetznerImage ?? "ubuntu-24.04",
     awsRegion,
     awsAMI: input.awsAMI ?? "",
-    awsUseStockImage: false,
+    awsUseStockImage,
     awsPromotedAMIs: {},
     awsSnapshot: input.awsSnapshot ?? "",
     awsSGID: input.awsSGID ?? "",
     awsSGName: "",
     awsSubnetID: input.awsSubnetID ?? "",
     awsProfile: input.awsProfile ?? "",
-    awsRootGB: input.awsRootGB ?? 400,
+    awsRootGB: input.awsRootGB ?? 0,
     awsInstanceTypes,
     awsPrivate,
     awsRequireSSM,
@@ -374,6 +436,7 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
     gcpRootGB: input.gcpRootGB ?? 0,
     gcpServiceAccount: input.gcpServiceAccount ?? "",
     capacityMarket: input.capacity?.market ?? "spot",
+    ...(capacityRequirements ? { capacityRequirements } : {}),
     capacityStrategy: input.capacity?.strategy ?? "most-available",
     capacityFallback: input.capacity?.fallback ?? "on-demand-after-120s",
     capacityRegions,
@@ -390,6 +453,8 @@ export function leaseConfig(input: LeaseRequest, defaults: LeaseConfigDefaults =
         : defaultWorkRoot(target, windowsMode, sshUser)),
     ttlSeconds,
     idleTimeoutSeconds,
+    leasePolicy: policy,
+    ...(policyNotice ? { policyNotice } : {}),
     keep: input.keep ?? false,
     sshPublicKey,
     sshHostPrivateKey: "",
@@ -1387,16 +1452,111 @@ export function awsInstanceTypeIsARM64(instanceType: string): boolean {
   return /^[cmr][0-9]+g[dn]?$/.test(family);
 }
 
-function clampTTL(ttlSeconds: number): number {
-  if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
-    return 5400;
-  }
-  return Math.min(Math.trunc(ttlSeconds), 86_400);
+export interface LeasePolicy {
+  defaultTTLSeconds: number;
+  defaultIdleTimeoutSeconds: number;
+  maxTTLSeconds: number;
+  extension: "allow" | "deny";
+  autoExtend: "allow" | "deny";
+  runtimeExtension?: boolean;
 }
 
-function clampIdleTimeout(seconds: number): number {
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    return 1800;
+type PolicyOverrides = {
+  orgs?: Record<string, Partial<LeasePolicy>>;
+  owners?: Record<string, Partial<LeasePolicy>>;
+};
+const durationPolicyFields = [
+  "defaultTTLSeconds",
+  "defaultIdleTimeoutSeconds",
+  "maxTTLSeconds",
+] as const;
+const switchPolicyFields = ["extension", "autoExtend"] as const;
+
+function parsedPolicyOverrides(env: Partial<Env>): PolicyOverrides | undefined {
+  if (!env.CRABBOX_LEASE_POLICY_OVERRIDES) return {};
+  try {
+    const value: unknown = JSON.parse(env.CRABBOX_LEASE_POLICY_OVERRIDES);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    for (const [group, entries] of Object.entries(value)) {
+      if (
+        !["orgs", "owners"].includes(group) ||
+        !entries ||
+        typeof entries !== "object" ||
+        Array.isArray(entries)
+      )
+        return undefined;
+      for (const entry of Object.values(entries)) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+        for (const [key, field] of Object.entries(entry)) {
+          if (durationPolicyFields.some((name) => name === key)) {
+            if (
+              !Number.isInteger(field) ||
+              typeof field !== "number" ||
+              field < 1 ||
+              field > 86_400
+            )
+              return undefined;
+          } else if (switchPolicyFields.some((name) => name === key)) {
+            if (field !== "allow" && field !== "deny") return undefined;
+          } else return undefined;
+        }
+      }
+    }
+    return value as PolicyOverrides;
+  } catch {
+    return undefined;
   }
-  return Math.min(Math.trunc(seconds), 86_400);
+}
+
+// Pure validation lets the coordinator log once at construction, without logging on every read.
+export function leasePolicyOverridesInvalid(env: Partial<Env>): boolean {
+  return parsedPolicyOverrides(env) === undefined;
+}
+
+export function resolveLeasePolicy(env: Partial<Env>, owner = "", org = ""): LeasePolicy {
+  const seconds = (value: string | undefined, fallback: number): number => {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 86_400) : fallback;
+  };
+  const global: LeasePolicy = {
+    defaultTTLSeconds: seconds(env.CRABBOX_LEASE_DEFAULT_TTL_SECONDS, 1800),
+    defaultIdleTimeoutSeconds: seconds(env.CRABBOX_LEASE_DEFAULT_IDLE_TIMEOUT_SECONDS, 1800),
+    maxTTLSeconds: seconds(env.CRABBOX_LEASE_MAX_TTL_SECONDS, 14_400),
+    extension: env.CRABBOX_LEASE_EXTENSION === "deny" ? "deny" : "allow",
+    autoExtend: env.CRABBOX_LEASE_AUTO_EXTEND === "deny" ? "deny" : "allow",
+  };
+  const overrides = parsedPolicyOverrides(env);
+  const policy = {
+    ...global,
+    ...(org === MISSING_ORG_KEY ? undefined : overrides?.orgs?.[orgLabelFromKey(org) ?? org]),
+    ...overrides?.owners?.[owner],
+  };
+  policy.defaultTTLSeconds = Math.min(policy.defaultTTLSeconds, policy.maxTTLSeconds);
+  policy.defaultIdleTimeoutSeconds = Math.min(
+    policy.defaultIdleTimeoutSeconds,
+    policy.maxTTLSeconds,
+  );
+  return policy;
+}
+
+export function clampLeaseDurations(
+  input: { ttlSeconds?: number; idleTimeoutSeconds?: number },
+  policy: LeasePolicy,
+): { ttlSeconds: number; idleTimeoutSeconds: number; policyNotice?: string } {
+  const positive = (value: number | undefined, fallback: number): number =>
+    value !== undefined && Number.isFinite(value) && value > 0
+      ? Math.max(1, Math.trunc(value))
+      : fallback;
+  const requestedTTL = positive(input.ttlSeconds, policy.defaultTTLSeconds);
+  const ttlSeconds = Math.min(
+    requestedTTL,
+    policy.extension === "deny" ? policy.defaultTTLSeconds : policy.maxTTLSeconds,
+  );
+  const requestedIdle = positive(input.idleTimeoutSeconds, policy.defaultIdleTimeoutSeconds);
+  const idleTimeoutSeconds = Math.min(requestedIdle, ttlSeconds, policy.maxTTLSeconds);
+  const policyNotice =
+    requestedTTL !== ttlSeconds || requestedIdle !== idleTimeoutSeconds
+      ? `Lease policy clamped lifetime to ${ttlSeconds}s and idle timeout to ${idleTimeoutSeconds}s (maximum ${policy.maxTTLSeconds}s; extension ${policy.extension}).`
+      : undefined;
+  return { ttlSeconds, idleTimeoutSeconds, ...(policyNotice ? { policyNotice } : {}) };
 }

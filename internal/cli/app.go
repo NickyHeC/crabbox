@@ -18,6 +18,7 @@ type App struct {
 
 	runOutcome             *shardRunOutcome
 	runEnvDenylist         []string
+	egressClientRuntime    bool
 	workspaceOwnerAcquirer func(context.Context, SSHTarget, string, io.Writer) (*workspaceOwner, error)
 	sshReadinessWaiter     func(context.Context, *SSHTarget, io.Writer, string, time.Duration) error
 }
@@ -52,6 +53,8 @@ func (a App) Run(ctx context.Context, args []string) error {
 		return a.webVNCDaemonSupervisor(ctx, args[1:])
 	case "__namespace-instance-proxy":
 		return a.namespaceInstanceProxy(ctx, args[1:])
+	case "__serve-relay-proxy":
+		return a.serveRelayProxy(ctx, args[1:])
 	case "__phala-proxy":
 		return a.phalaProxy(ctx, args[1:])
 	case "__herdr-plugin":
@@ -123,6 +126,8 @@ func (a App) directCommandHelp(ctx context.Context, args []string) (error, bool)
 		return a.verify(ctx, helpArgs), true
 	case "status":
 		return a.status(ctx, helpArgs), true
+	case "extend":
+		return a.extend(ctx, helpArgs), true
 	case "heartbeat":
 		return a.heartbeat(ctx, helpArgs), true
 	case "list":
@@ -167,6 +172,8 @@ func (a App) directCommandHelp(ctx context.Context, args []string) (error, bool)
 		return a.stop(ctx, helpArgs), true
 	case "pause":
 		return a.pause(ctx, helpArgs), true
+	case "hold":
+		return a.hold(ctx, helpArgs), true
 	case "resume":
 		return a.resume(ctx, helpArgs), true
 	case "cleanup":
@@ -209,6 +216,7 @@ Commands:
   logout      Remove the stored broker token
   whoami      Show broker identity
   doctor      Check local and broker/provider readiness
+  serve       Donate trusted container capacity to the coordinator
   warmup      Lease a box and wait until it is ready
   prewarm     Lease and hydrate a reusable test-ready box
   run         Sync the repo, run a remote command, stream output
@@ -231,6 +239,7 @@ Commands:
   verify      Verify a signed run receipt
   cache       Inspect, purge, warm, or list remote cache volumes
   status      Show lease state; add --wait to block until ready
+  extend      Extend a lease within its lifetime policy
   heartbeat   Refresh a lease idle deadline and print its state
   claims      Inspect unverified local lease claims without loading providers
   list        List Crabbox machines
@@ -238,7 +247,7 @@ Commands:
   unshare     Remove lease sharing
   image       Create provider images and promote brokered AWS runner images
   usage       Show cost and usage estimates by user, org, or fleet
-  capacity    Show self-owner admission count and effective owner limit
+  capacity    Show fleet, org, and owner lease headroom
   marketplace  Preview the Crabbox credits gateway and smart routing quotes
   admin       Lease admin controls for trusted operators
   actions     Hydrate boxes from repo workflows or GitHub runners
@@ -259,6 +268,7 @@ Commands:
   inspect     Print lease/provider details; add --json for scripts
   stop        Release a lease or delete a direct-provider machine
   pause       Pause a lease, freeing remote compute while preserving state
+  hold        Retain an exact failed lease and its resources for salvage
   resume      Resume a previously paused lease
   cleanup     Sweep expired direct-provider machines or local provider state
   pool        Manage ready-pool leases and list machine inventory aliases
@@ -368,7 +378,8 @@ Environment:
   CRABBOX_ORG                  Usage org override
   CRABBOX_CONFIG               Optional config path
   CRABBOX_IDLE_TIMEOUT         Default idle expiry, e.g. 30m
-  CRABBOX_TTL                  Maximum lease lifetime, e.g. 90m
+  CRABBOX_TTL                  Lease lifetime (default 30m)
+  CRABBOX_MAX_TTL              Direct lease ceiling (default 4h, at most 24h)
   CRABBOX_AWS_REGION           Default eu-west-1
   CRABBOX_AWS_SSH_CIDRS        Comma-separated AWS SSH source CIDRs
   CRABBOX_SSH_FALLBACK_PORTS   Comma-separated SSH fallback ports, or none

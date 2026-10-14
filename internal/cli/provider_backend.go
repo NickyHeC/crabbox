@@ -32,6 +32,26 @@ type ProviderConfigValidator interface {
 	ValidateConfig(cfg Config) error
 }
 
+// ProviderConfiguredFeatures supplies features enabled by trusted runtime
+// configuration. Spec remains the conservative, configuration-free catalog.
+type ProviderConfiguredFeatures interface {
+	ConfiguredFeatures(cfg Config) FeatureSet
+	ValidateRequestedCapabilities(cfg Config) error
+}
+
+func ProviderFeaturesForConfig(provider Provider, cfg Config) FeatureSet {
+	if configured, ok := provider.(ProviderConfiguredFeatures); ok {
+		return configured.ConfiguredFeatures(cfg)
+	}
+	return provider.Spec().Features
+}
+
+// CoordinatorAcquisitionFallback chooses one alternate provider only after an
+// authoritative capacity rejection. Fixed-ID operations never change provider.
+type CoordinatorAcquisitionFallback interface {
+	AcquisitionFallback(error) (string, bool)
+}
+
 // CoordinatorAcquireValidator keeps provider-owned creation policy at broker
 // acquisition; configuration checks must not prevent existing-lease cleanup.
 type CoordinatorAcquireValidator interface {
@@ -78,6 +98,12 @@ type DesktopLeaseCapabilityProvider interface {
 // architecture tuple (including amd64), within ProviderSpec.Targets. Providers
 // without this capability retain core's managed architecture restrictions.
 // Runtime feasibility and explicit assertions are validated by the adapter.
+// ProviderResourceRequirementsCapability admits provisioned CPU/RAM constraints.
+// Providers without this capability must reject constrained acquisition.
+type ProviderResourceRequirementsCapability interface {
+	SupportsResourceRequirements(cfg Config) bool
+}
+
 type ProviderArchitectureCapability interface {
 	SupportsArchitecture(cfg Config, architecture string) bool
 }
@@ -98,6 +124,12 @@ type ProviderReadyPoolImageIdentityRequest struct {
 // of immutable image evidence returned with a typed ready-pool lease.
 type ProviderReadyPoolImageIdentityCapability interface {
 	ReadyPoolImageIdentityMatchesLease(ProviderReadyPoolImageIdentityRequest) bool
+}
+
+// CoordinatorArchitecturePolicy lets a provider place on a machine of either
+// supported architecture when the caller did not explicitly select one.
+type CoordinatorArchitecturePolicy interface {
+	CoordinatorSelectsArchitecture() bool
 }
 
 // ProviderConfigArchitectureDescriber describes an omitted architecture for
@@ -452,6 +484,7 @@ type PortsRequest struct {
 
 type CopyRequest struct {
 	Options     LeaseOptions
+	RepoRoot    string
 	ID          string
 	Source      string
 	Destination string
@@ -719,6 +752,30 @@ type NativeCheckpointForkProvider interface {
 	ApplyNativeCheckpointForkConfig(req NativeCheckpointForkRequest) error
 }
 
+// DelegatedCheckpointBackend lets a delegated-run backend, which exposes no SSH
+// target, create and fork native checkpoints. Its provider still implements
+// NativeCheckpointProvider and NativeCheckpointLifecycleProvider.
+type DelegatedCheckpointBackend interface {
+	DelegatedRunBackend
+	// ResolveCheckpointSource resolves a lease the current repository already
+	// claims; it never adopts or reclaims one.
+	ResolveCheckpointSource(ctx context.Context, req ResolveRequest) (LeaseTarget, error)
+	// ForkNativeCheckpoint creates and claims one lease started from the record.
+	ForkNativeCheckpoint(ctx context.Context, req DelegatedCheckpointForkRequest) (DelegatedCheckpointFork, error)
+}
+
+type DelegatedCheckpointForkRequest struct {
+	Repo          Repo
+	RequestedSlug string
+	Record        NativeCheckpointForkRecord
+	Workdir       string
+}
+
+type DelegatedCheckpointFork struct {
+	Lease   LeaseTarget
+	Workdir string
+}
+
 type NativeCheckpointForkFlagProvider interface {
 	ApplyNativeCheckpointForkFlags(cfg *Config, fs *flag.FlagSet, values any) error
 }
@@ -726,6 +783,20 @@ type NativeCheckpointForkFlagProvider interface {
 type JSONListBackend interface {
 	Backend
 	ListJSON(ctx context.Context, req ListRequest) (any, error)
+}
+
+// StreamingListBackend emits bounded pages in display order. Callbacks are
+// synchronous: returning an error cancels outstanding reads.
+type StreamingListBackend interface {
+	Backend
+	StreamList(context.Context, ListRequest, func(ListPage) error) error
+}
+
+type ListPage struct {
+	Servers []Server
+	JSON    any
+	Section string
+	More    bool
 }
 
 // DelegatedFixedWarmupBackend explicitly opts into durable delegated acquisition.
@@ -756,11 +827,23 @@ type IdempotentLeaseIDBackend interface {
 	SupportsRequestedLeaseID() bool
 }
 
+// ProviderBackendCapabilitySource exposes a metadata-only backend without
+// configuration, credentials, clients, or side effects. Catalogs inspect its
+// capability interfaces; they must not invoke lifecycle methods.
+type ProviderBackendCapabilitySource interface {
+	BackendCapabilities() Backend
+}
+
 type CheckpointLeaseIDBackend interface {
 	SupportsRequestedCheckpointID() bool
 }
 
 type ProviderSpec struct {
+	// ClaimExpiryBound is the provider-enforced maximum lifetime after use.
+	// Zero means that age alone cannot authorize local claim pruning. Only
+	// opt in when expiry needs no running CLI and any settlement the claim
+	// guards is itself bounded by the same duration.
+	ClaimExpiryBound time.Duration
 	Authentication   ProviderAuthentication
 	Name             string
 	Aliases          []string
@@ -769,6 +852,7 @@ type ProviderSpec struct {
 	Targets          []TargetSpec
 	Features         FeatureSet
 	Coordinator      CoordinatorMode
+	BrokeredOnly     bool
 	ClassDisposition ProviderClassDisposition
 	SizeSelection    ProviderSizeSelector
 	// SyncGuardrailFullCandidate counts the complete ordinary workspace transfer.
@@ -823,12 +907,16 @@ const (
 	FeatureRunArtifacts Feature = "run-artifacts"
 	FeatureRunDownloads Feature = "run-downloads"
 	FeatureModuleRun    Feature = "module-run"
+	// FeatureShellScriptRun admits shell script input to a delegated command owner.
+	FeatureShellScriptRun Feature = "shell-script-run"
 	// FeatureSSHScriptRun routes explicit scripts through the core SSH owner,
 	// while a hybrid backend may delegate ordinary commands.
 	FeatureSSHScriptRun Feature = "ssh-script-run"
 	// FeatureClaimExec requires ExecLeaseClaimResolver, private POSIX SSH execution,
 	// and provider-owned idle activity that does not require exclusive claim writes.
 	FeatureClaimExec Feature = "claim-exec"
+	// FeatureFixedLeaseID advertises caller-supplied idempotent lease IDs.
+	FeatureFixedLeaseID Feature = "fixed-lease-id"
 	// FeatureFixedCurrentRepoStop requires RepositoryScopedStopBackend for fixed IDs.
 	FeatureFixedCurrentRepoStop Feature = "fixed-current-repo-stop"
 	FeaturePauseResume          Feature = "pause-resume"
@@ -1337,9 +1425,10 @@ type TouchRequest struct {
 }
 
 type ListRequest struct {
-	Options LeaseOptions
-	All     bool
-	Refresh bool
+	Options  LeaseOptions
+	All      bool
+	Refresh  bool
+	Retained bool
 }
 
 type RunRequest struct {
@@ -1990,6 +2079,9 @@ func loadBackend(cfg Config, rt Runtime) (Backend, error) {
 	if err := validateControllerCoordinatorRegistrationBinding(cfg); err != nil {
 		return nil, err
 	}
+	if !ShouldUseCoordinator(cfg, provider.Spec()) {
+		cfg = clampDirectLeaseDurations(cfg)
+	}
 	backend, err := configureProviderBackend(provider, &cfg, rt)
 	if err != nil {
 		return nil, err
@@ -2032,6 +2124,9 @@ func backendCoordinator(backend Backend) *CoordinatorClient {
 }
 
 func leaseOptionsFromConfig(cfg Config) LeaseOptions {
+	if provider, err := ProviderFor(cfg.Provider); err == nil && !ShouldUseCoordinator(cfg, provider.Spec()) {
+		cfg = clampDirectLeaseDurations(cfg)
+	}
 	return LeaseOptions{
 		TargetOS:      cfg.TargetOS,
 		WindowsMode:   cfg.WindowsMode,
@@ -2126,7 +2221,7 @@ func rejectDelegatedSyncOptionsForSpec(spec ProviderSpec, req RunRequest) error 
 	if req.StopAfter != "" {
 		return Exit(2, "%s delegates run execution; --stop-after is not supported", provider)
 	}
-	if (req.Script != nil || req.ScriptRequested) && !moduleRun {
+	if (req.Script != nil || req.ScriptRequested) && !moduleRun && !spec.Features.Has(FeatureShellScriptRun) {
 		return Exit(2, "%s delegates run execution; --script is not supported", provider)
 	}
 	if moduleRun && len(req.Command) > 0 {
@@ -2145,15 +2240,19 @@ func RejectDelegatedSyncOptionsForSpec(spec ProviderSpec, req RunRequest) error 
 	return rejectDelegatedSyncOptionsForSpec(spec, req)
 }
 
-func renderServerList(stdout io.Writer, servers []Server) {
+func renderServerList(stdout io.Writer, servers []Server) error {
 	for _, s := range servers {
 		extra := ""
 		if orphan := strings.TrimSpace(s.Labels["orphan"]); orphan != "" {
 			extra = " " + orphan
 		}
-		fmt.Fprintf(stdout, "%-20s %-28s %-12s %-14s %-15s lease=%s slug=%s keep=%s target=%s%s\n",
-			s.DisplayID(), s.Name, s.Status, s.ServerType.Name, s.PublicNet.IPv4.IP, s.Labels["lease"], blank(ServerSlug(s), "-"), s.Labels["keep"], s.Labels["target"], extra)
+		extra += lifetimePolicySummary(s.LifetimePolicy)
+		if _, err := fmt.Fprintf(stdout, "%-20s %-28s %-12s %-14s %-15s lease=%s slug=%s keep=%s target=%s%s\n",
+			s.DisplayID(), s.Name, s.Status, s.ServerType.Name, s.PublicNet.IPv4.IP, s.Labels["lease"], blank(ServerSlug(s), "-"), s.Labels["keep"], s.Labels["target"], extra); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 const bestEffortLeaseTouchTimeout = 20 * time.Second
@@ -2174,7 +2273,7 @@ func (a App) touchLeaseTargetBestEffort(ctx context.Context, cfg Config, lease L
 	}
 	touchCtx, cancel := context.WithTimeout(ctx, bestEffortLeaseTouchTimeout)
 	defer cancel()
-	server, err := sshBackend.Touch(touchCtx, TouchRequest{Lease: lease, State: state, IdleTimeout: cfg.IdleTimeout})
+	server, err := touchLeaseWithGuestExpiry(touchCtx, sshBackend, cfg, TouchRequest{Lease: lease, State: state, IdleTimeout: cfg.IdleTimeout})
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "warning: touch failed for %s: %v\n", lease.LeaseID, err)
 		return lease.Server
@@ -2190,4 +2289,28 @@ func RuntimeForProviderOperation(stderr io.Writer) Runtime {
 		stderr = io.Discard
 	}
 	return Runtime{Stdout: io.Discard, Stderr: stderr, Clock: realClock{}, Exec: execCommandRunner{}}
+}
+
+// LeaseExtensionBackend updates provider metadata under the exact lease claim.
+// File-backed guest guards are refreshed after the provider deadline is saved.
+type LeaseExtensionBackend interface {
+	ExtendLease(context.Context, LeaseExtendRequest) (LeaseExtendResult, error)
+}
+
+type LeaseExtendRequest struct {
+	Lease  LeaseTarget
+	TTL    time.Duration
+	By     time.Duration
+	Reason string
+}
+
+type LeaseExtendResult struct {
+	ID                        string `json:"id"`
+	ExpiresAt                 string `json:"expiresAt"`
+	Remaining                 string `json:"remainingLifetime"`
+	MaxLifetime               string `json:"maxLifetime"`
+	RuntimeExtension          bool   `json:"runtimeExtension"`
+	GuestExpiresAt            string `json:"guestExpiresAt,omitempty"`
+	GuestExpiryRefreshPending bool   `json:"guestExpiryRefreshPending,omitempty"`
+	Error                     string `json:"error,omitempty"`
 }

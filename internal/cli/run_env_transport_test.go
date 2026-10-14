@@ -343,3 +343,90 @@ printf '%s' "$BUILD_FLAVOR"`, "sh", payloadPath)
 		}
 	}
 }
+
+func TestRunEnvCleanupFailurePreservesWorkloadStatusAndRedactsOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX SSH fixture")
+	}
+	for _, test := range []struct {
+		name       string
+		workload   error
+		wantCode   int
+		wantStatus RunStatus
+		wantKind   RunErrorKind
+	}{
+		{"success", nil, 7, RunStatusFailed, RunErrorProvider},
+		{"workload failure", Exit(23, "workload exited 23"), 23, RunStatusFailed, RunErrorProvider},
+		{"timeout", context.DeadlineExceeded, 1, RunStatusTimedOut, RunErrorTimeout},
+		{"cancellation", context.Canceled, 1, RunStatusCanceled, RunErrorCanceled},
+		{"stored owner timeout", functionalPreflightOwnerError{
+			err:   errors.Join(Exit(7, "owner timed out"), context.Canceled),
+			cause: context.DeadlineExceeded,
+		}, 7, RunStatusTimedOut, RunErrorTimeout},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			isolateTestUserDirs(t)
+			dir := t.TempDir()
+			workdir := t.TempDir()
+			mustWriteTestFile(t, filepath.Join(dir, "ssh"), `#!/bin/sh
+for arg do remote=$arg; done
+case "$remote" in
+ *'rm -f --'*) printf 'secret-cleanup-canary' >&2;exit 9 ;;
+ *) /bin/sh -c "$remote" ;;
+esac
+`)
+			if err := os.Chmod(filepath.Join(dir, "ssh"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			var diagnostics bytes.Buffer
+			prepared, err := stageSSHCommandEnv(t.Context(), SSHTarget{Host: "fixture.invalid", User: "fixture", Port: "22", TargetOS: targetLinux}, workdir, map[string]string{"TEST_VALUE": "secret-cleanup-canary"}, &diagnostics)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = test.workload
+			prepared.closeAfter(&err)
+			if ExitCodeForError(err, 1) != test.wantCode || !strings.Contains(err.Error(), "environment cleanup failed") || !strings.Contains(err.Error(), shellDir(prepared.File)) {
+				t.Fatalf("cleanup result=%v", err)
+			}
+			if test.workload != nil && (!errors.Is(err, test.workload) || !strings.HasPrefix(err.Error(), test.workload.Error())) {
+				t.Fatalf("workload error lost precedence: %v", err)
+			}
+			if RunStatusForResult(RunResult{}, err) != test.wantStatus || RunErrorKindForResult(RunResult{}, err) != test.wantKind {
+				t.Fatalf("cleanup changed primary classification: %v", err)
+			}
+			if strings.Contains(err.Error()+diagnostics.String(), "secret-cleanup-canary") {
+				t.Fatal("cleanup output leaked")
+			}
+		})
+	}
+}
+
+func TestRunEnvCleanupCancellationKeepsPrimaryOutcome(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		primary    error
+		cleanup    error
+		result     RunResult
+		wantStatus RunStatus
+		wantKind   RunErrorKind
+		wantCode   int
+	}{
+		{"timeout then canceled cleanup", errors.Join(Exit(7, "owner timed out"), context.DeadlineExceeded), context.Canceled, RunResult{}, RunStatusTimedOut, RunErrorTimeout, 7},
+		{"provider failure then cleanup timeout", errors.New("owner failed"), context.DeadlineExceeded, RunResult{}, RunStatusFailed, RunErrorProvider, 1},
+		{"workload failure then canceled cleanup", Exit(23, "workload failed"), context.Canceled, RunResult{ExitCode: 23}, RunStatusFailed, RunErrorCommandExit, 23},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanupErr := errors.Join(Exit(7, "synthetic cleanup failure"), test.cleanup)
+			prepared := sshCommandEnv{close: func() error { return cleanupErr }}
+			err := test.primary
+			prepared.closeAfter(&err)
+			if !errors.Is(err, test.primary) || !strings.Contains(err.Error(), cleanupErr.Error()) {
+				t.Fatalf("missing primary error or cleanup diagnostic: %v", err)
+			}
+			if RunStatusForResult(test.result, err) != test.wantStatus || RunErrorKindForResult(test.result, err) != test.wantKind || ExitCodeForError(err, 1) != test.wantCode {
+				t.Fatalf("cleanup changed primary outcome: %v", err)
+			}
+		})
+	}
+}

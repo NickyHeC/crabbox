@@ -42,6 +42,9 @@ type fakeAzureClient struct {
 	createCfg         core.Config
 	createErr         error
 	fixedReplyErr     error
+	fixedCapacityErr  error
+	fixedSettleErr    error
+	fixedSettled      []core.AzureFixedCompanions
 	createFunc        func(core.Server) core.Server
 	waitFunc          func(core.Server) (core.Server, error)
 	waitCalls         int
@@ -146,6 +149,10 @@ func (c *fakeAzureClient) PrepareCleanupServer(_ context.Context, server core.Se
 	return server, nil
 }
 
+func (c *fakeAzureClient) PrepareCleanupRecoveryServer(ctx context.Context, server core.Server, now time.Time) (core.Server, error) {
+	return c.PrepareCleanupServer(ctx, server, now)
+}
+
 func (c *fakeAzureClient) DeleteOwnedServer(_ context.Context, server core.Server) error {
 	c.ownedExpected = append(c.ownedExpected, server)
 	if c.deleteOwnedFunc != nil {
@@ -212,7 +219,7 @@ func TestAzureTouchUsesProviderClientBestEffort(t *testing.T) {
 			t.Cleanup(func() { newAzureClient = oldClient })
 			var stderr bytes.Buffer
 			backend := NewAzureLeaseBackend(core.ProviderSpec{Name: "azure"}, core.Config{}, core.Runtime{Stderr: &stderr}).(*azureLeaseBackend)
-			server := core.Server{CloudID: tc.cloudID, Name: "fallback-name", Provider: "azure", Labels: map[string]string{"idle_timeout_secs": "1800"}}
+			server := core.Server{CloudID: tc.cloudID, Name: "fallback-name", Provider: "azure", Labels: map[string]string{"idle_timeout_secs": "1800", "ttl_secs": "7200"}}
 			got, err := backend.Touch(context.Background(), core.TouchRequest{Lease: core.LeaseTarget{Server: server}, State: "ready", IdleTimeoutOverride: tc.override})
 			if err != nil || got.Labels["state"] != "ready" {
 				t.Fatalf("server=%+v err=%v", got, err)

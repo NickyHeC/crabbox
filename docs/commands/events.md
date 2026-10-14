@@ -36,6 +36,14 @@ The exact set depends on the run: an Actions-hydrated run emits the
 `actions.hydrate.*` events, a run that swaps a dead box mid-flight emits the
 `lease.replace.*` events, and so on.
 
+`lease.released` records an accepted release, which may leave cleanup unconfirmed
+or intentionally retain the lease. Its phase is `cleanup` with a
+`leaseStopped=false` message in those cases. The phase is `released` with a
+`leaseStopped=true` message only when the release owner confirms that lease
+recovery has ended. `--type lease.released` includes both outcomes; `--phase released`
+selects confirmed outcomes from current clients. Older clients emitted that phase
+without confirmation, so historical events alone do not prove cleanup completed.
+
 ## Output
 
 Human-readable output prints the sequence number, type, phase, stream, and
@@ -51,7 +59,7 @@ timestamp followed by the message (falling back to the event's data text):
 0007 command.started    phase=command    stream=- at=2026-05-07T07:43:08Z pnpm test
 0008 stdout             phase=command    stream=stdout at=2026-05-07T07:43:09Z > vitest run
 ...
-0043 lease.released     phase=release    stream=- at=2026-05-07T07:45:34Z
+0043 lease.released     phase=cleanup    stream=- at=2026-05-07T07:45:34Z leaseStopped=false; lease retained or cleanup unconfirmed
 ```
 
 `--json` emits the raw event records (sequence, type, phase, stream,
@@ -154,7 +162,7 @@ network latency and existing retries, not provider-side execution durations.
 | --- | --- |
 | `admission` | Lifecycle lock wait, configuration preparation, pricing, usage counting, limit checks, access snapshot, provider preparation, ready-pool inventory reads when executed, and reservation/preparation record publication |
 | `aws` | Existing diagnostic buckets for key pair, image, ingress/lifecycle waits, security group and ingress operations, quota, instance types, instance create and image cleanup; plus user-data/request rendering |
-| `gcp` | Token mint on cache miss, image and zone selection, firewall GET/PUT/insert and operation wait, user-data rendering, combined boot-disk/instance insert and instance operation wait |
+| `gcp` | Token mint on cache miss, image and zone selection, root-disk image/snapshot minimum lookup on cache miss (`gcp.image_minimum`), firewall GET/PUT/insert and operation wait, user-data rendering, combined boot-disk/instance insert and instance operation wait |
 | `hetzner` | SSH key registration, image selection, user-data rendering and server create |
 | `azure` | SKU availability and existing attempt duration, including network setup and checked cleanup for failed attempts |
 
