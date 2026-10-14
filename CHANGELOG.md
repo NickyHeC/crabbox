@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Preserve local Git seed output-limit and write failures alongside command errors, so a secondary broken pipe does not hide the bounded refusal or expose repository output.
+- Stream local Git seed object enumeration up to one million fixed-width records instead of rejecting the complete ID list at 16 MiB. Other metadata, object-byte, bundle-byte, and deadline bounds are unchanged.
+
 ## 0.69.0 - 2026-09-29
 
 ### Highlights
