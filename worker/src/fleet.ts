@@ -7,6 +7,7 @@ import { AWSVPCCache } from "./aws-vpc-cache";
 import {
   classifyDurableObjectFailure,
   durableObjectFailureResponse,
+  isDurableObjectStorageFailure,
   logDurableObjectFailure,
 } from "./durable-object-errors";
 import {
@@ -1756,7 +1757,9 @@ export class FleetCoordinator {
       }
       // Storage failures caught inside the coordinator never reach the Worker boundary.
       // Preserve the same retryable response there without replaying a possibly committed write.
-      const kind = classifyDurableObjectFailure(error);
+      const kind = isDurableObjectStorageFailure(error)
+        ? classifyDurableObjectFailure(error)
+        : "internal_error";
       if (kind !== "internal_error") {
         logDurableObjectFailure(error, request);
         return runEventAppendFailureResponse(request) ?? durableObjectFailureResponse(kind);

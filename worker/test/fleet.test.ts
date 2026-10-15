@@ -932,7 +932,7 @@ describe("coordinator storage failure responses", () => {
     },
   );
 
-  it("uses the same transient response in the Node coordinator", async () => {
+  it("does not classify unmarked Node errors as Cloudflare storage failures", async () => {
     const storage = new MemoryStorage();
     storage.beforeGet = async (key) => {
       if (key === "lease:cbx_000000000001") throw new Error("Network connection lost");
@@ -942,14 +942,41 @@ describe("coordinator storage failure responses", () => {
       const response = await testCoordinator(storage).fetch(
         request("GET", "/v1/leases/cbx_000000000001"),
       );
-      expect(response.status).toBe(503);
-      expect(await response.json()).toMatchObject({
-        error: "coordinator_unavailable",
-        retryable: true,
-      });
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({ error: "Network connection lost" });
+      expect(logged).not.toHaveBeenCalled();
     } finally {
       logged.mockRestore();
     }
+  });
+
+  it("keeps provider retryability flags out of storage error classification", async () => {
+    const error = Object.assign(new Error("provider temporarily unavailable"), {
+      retryable: true,
+      overloaded: true,
+    });
+    const fleet = testFleet(new MemoryStorage(), {
+      hetzner: {
+        ...fakeProvider(async () => {
+          throw error;
+        }),
+        provisioningFailureEvidence: () => ({ resourceMayExist: true, retryable: true }),
+      },
+    });
+    const response = await fleet.fetch(
+      request("POST", "/v1/leases", {
+        body: {
+          leaseID: "cbx_abcdef123456",
+          provider: "hetzner",
+          target: "linux",
+          sshPublicKey: "ssh-ed25519 provider-failure",
+        },
+      }),
+    );
+    const body = await response.json();
+    expect(response.status).toBe(500);
+    expect(response.headers.get("retry-after")).toBeNull();
+    expect(body).toEqual({ error: "provider temporarily unavailable" });
   });
 
   it("keeps unexpected application failures as 500", async () => {
@@ -59245,7 +59272,9 @@ describe("atomic legacy lease admission", () => {
     "retains uncertainty when %s commits but its authoritative reread fails",
     async (phase) => {
       const { storage, creates, fleet } = lostAcknowledgement(phase, true);
-      expect((await create(fleet())).status).toBe(500);
+      const response = await create(fleet());
+      expect(response.status).toBe(503);
+      expect(response.headers.get("retry-after")).toBe("2");
       storage.beforeGet = undefined;
       const count = phase === "admission" ? 0 : 1;
       expect(creates).toHaveBeenCalledTimes(count);
@@ -59304,7 +59333,8 @@ describe("atomic legacy lease admission", () => {
       creates++;
     });
     const response = await create(testFleet(storage, { hetzner: provider }));
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBe("2");
     expect(writes).toBe(3);
     expect(creates).toBe(1);
     expect(storage.value<LeaseRecord>(leaseKey)).toMatchObject({
