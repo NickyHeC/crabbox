@@ -125,6 +125,7 @@ import {
   githubUserIsAdmin,
   isAdminRequest,
   requestWithAuthContext,
+  requestGitHubCredential,
   verifiedPortalTokenExpiresAtForRevocation,
   verifiedUserTokenExpiresAtForRevocation,
   type AuthContext,
@@ -25196,7 +25197,7 @@ function pairingBrowserSession(
   if (!cookie || !token || !timingSafeEqual(cookie, token)) return undefined;
   const login = request.headers.get("x-crabbox-github-login")?.trim() ?? "";
   const tokenID = request.headers.get("x-crabbox-github-token-id")?.trim() ?? "";
-  const sealedCredential = request.headers.get("x-crabbox-github-sealed-credential")?.trim() ?? "";
+  const sealedCredential = requestGitHubCredential(request) ?? "";
   const expiresAt = request.headers.get("x-crabbox-token-expires-at")?.trim() ?? "";
   if (!login || !tokenID || !sealedCredential || Date.parse(expiresAt) <= Date.now()) {
     return undefined;
@@ -25380,7 +25381,7 @@ async function bridgeGrantForRequest(
   const token = bearerToken(request);
   const login = request.headers.get("x-crabbox-github-login")?.trim();
   const tokenID = request.headers.get("x-crabbox-github-token-id")?.trim();
-  const sealedCredential = request.headers.get("x-crabbox-github-sealed-credential")?.trim();
+  const sealedCredential = requestGitHubCredential(request);
   const expiresAt = request.headers.get("x-crabbox-token-expires-at")?.trim();
   if (
     !token ||
