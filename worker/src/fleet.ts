@@ -5,6 +5,11 @@ import { awsCleanupCompletionBlocker } from "./aws-cleanup-completion";
 import { AWSPoolAccess } from "./aws-pool-access";
 import { AWSVPCCache } from "./aws-vpc-cache";
 import {
+  classifyDurableObjectFailure,
+  durableObjectFailureResponse,
+  logDurableObjectFailure,
+} from "./durable-object-errors";
+import {
   coordinatorGCPFirewallCache,
   coordinatorGCPImageMinimumCache,
   coordinatorGCPTokenCache,
@@ -1747,6 +1752,13 @@ export class FleetCoordinator {
           { error: "provider_request_timeout", message: coordinatorErrorMessage(this.env, error) },
           { status: 503, headers: { "retry-after": "5" } },
         );
+      }
+      // Storage failures caught inside the coordinator never reach the Worker boundary.
+      // Preserve the same retryable response there without replaying a possibly committed write.
+      const kind = classifyDurableObjectFailure(error);
+      if (kind !== "internal_error") {
+        logDurableObjectFailure(error, request);
+        return runEventAppendFailureResponse(request) ?? durableObjectFailureResponse(kind);
       }
       return json({ error: coordinatorErrorMessage(this.env, error) }, { status: 500 });
     }

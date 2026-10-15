@@ -866,6 +866,104 @@ class FakeCoordinatorRuntime implements CoordinatorRuntime {
   }
 }
 
+describe("coordinator storage failure responses", () => {
+  it.each([
+    [new Error("Network connection lost"), "coordinator_unavailable", "2"],
+    [
+      new Error("Internal error in Durable Object storage caused object to be reset."),
+      "coordinator_unavailable",
+      "2",
+    ],
+    [
+      Object.assign(new Error("storage temporarily unavailable"), { retryable: true }),
+      "coordinator_unavailable",
+      "2",
+    ],
+    [
+      Object.assign(new Error("storage overloaded"), { overloaded: true }),
+      "coordinator_overloaded",
+      "5",
+    ],
+  ])(
+    "classifies a caught lease-read failure without replay: %s",
+    async (error, code, retryAfter) => {
+      const storage = new MemoryStorage();
+      const read = vi.fn<(key: string) => Promise<void>>(async (key) => {
+        if (key === "lease:cbx_000000000001") throw error;
+      });
+      storage.beforeGet = read;
+      const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const response = await testFleet(storage).fetch(
+          request("GET", "/v1/leases/cbx_000000000001"),
+        );
+        expect(response.status).toBe(503);
+        expect(await response.json()).toMatchObject({ error: code, retryable: true });
+        expect(response.headers.get("retry-after")).toBe(retryAfter);
+        expect(response.headers.get("cache-control")).toBe("no-store");
+        expect(read.mock.calls.filter(([key]) => key === "lease:cbx_000000000001")).toHaveLength(1);
+        expect(logged).toHaveBeenCalledTimes(1);
+      } finally {
+        logged.mockRestore();
+      }
+    },
+  );
+
+  it.each(["POST", "PUT"])(
+    "preserves the %s run-event retry contract without replay",
+    async (method) => {
+      const storage = new MemoryStorage();
+      const runID = "run_" + "a".repeat(32);
+      const read = vi.fn<(key: string) => Promise<void>>(async (key) => {
+        if (key === `run:${runID}`) throw new Error("Network connection lost");
+      });
+      storage.beforeGet = read;
+      const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const response = await testFleet(storage).fetch(
+          request(method, `/v1/runs/${runID}/events`, { body: { id: "b".repeat(32) } }),
+        );
+        expect(response.status).toBe(503);
+        expect(await response.json()).toEqual({ error: "run_event_append_unavailable" });
+        expect(read.mock.calls.filter(([key]) => key === `run:${runID}`)).toHaveLength(1);
+      } finally {
+        logged.mockRestore();
+      }
+    },
+  );
+
+  it("uses the same transient response in the Node coordinator", async () => {
+    const storage = new MemoryStorage();
+    storage.beforeGet = async (key) => {
+      if (key === "lease:cbx_000000000001") throw new Error("Network connection lost");
+    };
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const response = await testCoordinator(storage).fetch(
+        request("GET", "/v1/leases/cbx_000000000001"),
+      );
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({
+        error: "coordinator_unavailable",
+        retryable: true,
+      });
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  it("keeps unexpected application failures as 500", async () => {
+    const storage = new MemoryStorage();
+    storage.beforeGet = async (key) => {
+      if (key === "lease:cbx_000000000001") throw new Error("synthetic application error");
+    };
+    const response = await testFleet(storage).fetch(request("GET", "/v1/leases/cbx_000000000001"));
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "synthetic application error" });
+    expect(response.headers.get("retry-after")).toBeNull();
+  });
+});
+
 describe("terminal budget settlement", () => {
   it("preserves the last observation when maintenance completes legacy failed cleanup", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });

@@ -4,6 +4,7 @@
 
 ### Fixes
 
+- Coordinator: return retryable responses for transient storage failures caught inside request handling.
 - Serve: preserve CPU and user-idle readings on heavily loaded Macs with independent sampling deadlines and interval-idle CPU measurement, fall back to raw host CPU when container stats fail, and add opt-in per-signal diagnostics.
 
 ## 0.78.0 - 2026-10-14
