@@ -4,7 +4,7 @@
 
 ### Added
 
-- Docker Sandbox: add an opt-in Docker Cloud Sandboxes target with archive sync, result downloads, scoped ownership and native TTL cleanup. [Issue 2550](https://github.com/openclaw/crabbox/issues/2550). Thanks @coygeek (requested by).
+- Docker Sandbox: add an opt-in Docker Cloud Sandboxes target with archive sync, result downloads, scoped ownership and native TTL cleanup, requested by @coygeek. [PR 2863](https://github.com/openclaw/crabbox/pull/2863). Thanks @coygeek.
 
 ### Fixed
 
