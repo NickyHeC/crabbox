@@ -149,6 +149,43 @@ func TestDockerCloudReadiness(t *testing.T) {
 	}
 }
 
+func TestDockerCloudReadinessBeforeWorkspaceScan(t *testing.T) {
+	for _, operation := range []string{"run", "warmup"} {
+		for _, workspace := range []string{"existing", "missing"} {
+			t.Run(operation+"/"+workspace, func(t *testing.T) {
+				b, r, stderr := newCloudTest(t)
+				repo := cloudRepo(t)
+				if workspace == "missing" {
+					// Scanning this path fails, so the readiness error must win.
+					repo.Root = filepath.Join(t.TempDir(), "absent")
+				}
+				r.defaults["diagnose"] = scriptedReply{
+					stdout:   strings.Replace(cloudReadyJSON, `"Cloud entitlement","status":"pass"`, `"Cloud entitlement","status":"fail"`, 1),
+					exitCode: 1,
+				}
+				var err error
+				if operation == "warmup" {
+					err = b.Warmup(t.Context(), core.WarmupRequest{Repo: repo})
+				} else {
+					_, err = b.Run(t.Context(), core.RunRequest{Repo: repo, Command: []string{"true"}})
+				}
+				const want = "Docker cloud readiness: account lacks Cloud Sandboxes access; activate a Docker Agentic Platform subscription, then run sbx login"
+				if err == nil || err.Error() != want || core.ExitCodeForError(err, 1) != 2 {
+					t.Fatalf("err=%v, want exit 2: %s", err, want)
+				}
+				if strings.Contains(stderr.String(), "sync candidate") {
+					t.Fatalf("workspace scanned before readiness: %s", stderr.String())
+				}
+				for _, command := range []string{"create", "ls", "cp", "exec", "rm"} {
+					if call := findCall(r, command); call != nil {
+						t.Fatalf("unexpected cloud operation before readiness: %v", call.Args)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestDockerCloudLifecycleArchiveDownloadsAndReuse(t *testing.T) {
 	b, r, _ := newCloudTest(t)
 	repo := cloudRepo(t)

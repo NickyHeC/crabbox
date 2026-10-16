@@ -125,9 +125,6 @@ func (b *cloudBackend) create(ctx context.Context, c *sbxCLI, repo core.Repo, re
 	if err := validateCreateRepo(b.cfg, repo); err != nil {
 		return core.LeaseClaim{}, err
 	}
-	if err := c.cloudReady(ctx); err != nil {
-		return core.LeaseClaim{}, err
-	}
 	name := newSandboxName(repo)
 	id, err := c.cloudCreate(ctx, name)
 	if err != nil {
@@ -259,7 +256,9 @@ func (b *cloudBackend) Run(ctx context.Context, req core.RunRequest) (core.RunRe
 				return err
 			}
 			if req.ID == "" {
-				return core.ValidateDirectLeaseCreation(b.cfg)
+				if err := core.ValidateDirectLeaseCreation(b.cfg); err != nil {
+					return err
+				}
 			}
 			return c.cloudReady(ctx)
 		},

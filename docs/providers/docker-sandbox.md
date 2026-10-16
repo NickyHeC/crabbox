@@ -232,7 +232,7 @@ crabbox doctor --provider docker-sandbox --docker-sandbox-target cloud
 
 A Docker Agentic Platform subscription with Cloud Sandboxes access is required.
 Crabbox checks `sbx version --json` and `sbx --cloud diagnose --json` before
-allocation; CLI, version, authentication, cloud connectivity, and entitlement
+scanning or archiving the checkout for allocation; CLI, version, authentication, cloud connectivity, and entitlement
 checks must all pass. Doctor does not create a sandbox. Authentication remains
 owned by `sbx`; Crabbox neither reads nor stores Docker credentials.
 
@@ -242,8 +242,11 @@ covers the current structured diagnostics and `--static-mcp` interface.
 The official `docker/tap/sbx` cask pins a SHA-256 for Docker's release artifact.
 The v0.48.0 help was checked for `create`, `exec`, `cp`, `ls`, `diagnose`, `ttl`,
 and `rm`, including their `--cloud` forms. The signed-out diagnostic was checked
-with isolated empty user state. No real account or live allocation was used for
-that verification; the coordinator must run the live recipe below before merge.
+with isolated empty user state. Coordinator verification with a real account
+covered device-flow login and entitlement refusal: doctor and warmup returned
+exit 2 without allocating or changing inventory because the account lacked a
+Docker Agentic Platform subscription. The full live lifecycle remains unverified;
+the coordinator must run the live recipe below with an entitled account before merge.
 
 Sources: [installation](https://docs.docker.com/ai/sandboxes/install/),
 [cloud setup](https://docs.docker.com/ai/sandboxes/cloud/),
