@@ -300,7 +300,9 @@ switch, missing ID or changed name fails closed. Local claims cannot authorize
 cloud operations and cloud claims cannot authorize local operations.
 
 Crabbox maps `--ttl` to cloud `--ttl` with an explicit `--on-timeout delete`.
-The default when no Crabbox TTL is set is one hour; the maximum is 24 hours.
+Crabbox's effective TTL is 30 minutes by default and is passed explicitly,
+overriding Docker's one-hour native default. The provider maximum is 24 hours,
+subject to Crabbox's configured lifetime policy.
 The requested creation deadline is recorded in the claim and shown in labels.
 Retaining a lease does not disable expiration. Cloud compute is billable, and a
 laptop sleeping or closing Crabbox does not stop it. Native expiration is the
