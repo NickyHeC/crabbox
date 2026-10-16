@@ -19641,7 +19641,7 @@ func TestDockerSandboxBindingEnvironmentFloatAndPartialState(t *testing.T) {
 
 func TestDockerSandboxBindingStringsAndLists(t *testing.T) {
 	clearConfigEnv(t)
-	assertDockerSandboxBindingEqual(t, baseConfig().DockerSandbox, DockerSandboxConfig{CLIPath: "sbx", Agent: "shell"})
+	assertDockerSandboxBindingEqual(t, baseConfig().DockerSandbox, DockerSandboxConfig{Target: "local", CLIPath: "sbx", Agent: "shell"})
 	for _, trusted := range []bool{false, true} {
 		for _, raw := range []string{"", "  ", "fixture"} {
 			for _, list := range []*[]string{nil, new([]string(nil)), new([]string{}), new([]string{" raw ", "", "a,b", "dup", "dup"})} {
