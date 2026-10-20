@@ -252,7 +252,7 @@ func TestClientUsesSmolvmRESTShape(t *testing.T) {
 				t.Fatal(err)
 			}
 			if strings.Contains(body.Command, "mktemp -d") {
-				_ = json.NewEncoder(w).Encode(map[string]any{"exitCode": 0, "stdout": "/tmp/.crabbox-upload.abc\n"})
+				_ = json.NewEncoder(w).Encode(map[string]any{"exitCode": 0, "stdout": "/tmp/.crabbox-upload.1234567890\n"})
 				return
 			}
 			if strings.Contains(body.Command, "tar -xzf") {
@@ -268,7 +268,7 @@ func TestClientUsesSmolvmRESTShape(t *testing.T) {
 				t.Fatalf("exec body=%#v", body)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"exitCode": 0, "stdout": "hi\n", "stderr": "warn\n"})
-		case "/v1/machines/mach_1/files/tmp/.crabbox-upload.abc/payload":
+		case "/v1/machines/mach_1/files/tmp/.crabbox-upload.1234567890/payload":
 			if r.Method != http.MethodPut {
 				t.Fatalf("unexpected method %s on files route", r.Method)
 			}
@@ -350,7 +350,7 @@ func TestUploadsTravelOverFilesRouteNotExecBody(t *testing.T) {
 		}
 		stdout := ""
 		if bytes.Contains(body, []byte("mktemp -d")) {
-			stdout = "/staging/.crabbox-upload.abc\n"
+			stdout = "/staging/.crabbox-upload.1234567890\n"
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"exitCode": 0, "stdout": stdout})
 	}))
@@ -360,13 +360,13 @@ func TestUploadsTravelOverFilesRouteNotExecBody(t *testing.T) {
 	if err := c.InjectArchive(t.Context(), "mach_1", archive, "/workspace"); err != nil {
 		t.Fatal(err)
 	}
-	if got := uploads["/staging/.crabbox-upload.abc/payload"]; !bytes.Equal(got, archiveBytes) {
+	if got := uploads["/staging/.crabbox-upload.1234567890/payload"]; !bytes.Equal(got, archiveBytes) {
 		t.Fatalf("files route received %d archive bytes, want %d", len(got), len(archiveBytes))
 	}
 	if err := c.WriteFile(t.Context(), "mach_1", "/workspace/.crabbox-env", profile); err != nil {
 		t.Fatal(err)
 	}
-	if got := uploads["/staging/.crabbox-upload.abc/payload"]; string(got) != profile {
+	if got := uploads["/staging/.crabbox-upload.1234567890/payload"]; string(got) != profile {
 		t.Fatalf("files route received profile %q, want %q", got, profile)
 	}
 }
@@ -661,14 +661,14 @@ func TestExecExitCodePropagatesCamelAndSnake(t *testing.T) {
 }
 
 func TestExecPrefersExactOutputOverTruncatedText(t *testing.T) {
-	full := strings.Repeat("x", 64) + "\xff end"
+	full := strings.Repeat("x", 2<<20) + "\xff end"
 	for _, tc := range []struct {
 		name       string
 		resp       map[string]any
 		wantStdout string
 	}{
 		{"truncated text replaced by exact copy", map[string]any{"stdout": full[:8], "stdoutTruncated": true, "stdoutB64": base64.StdEncoding.EncodeToString([]byte(full))}, full},
-		{"truncated text without exact copy is marked", map[string]any{"stdout": full[:8], "stdoutTruncated": true}, full[:8] + "\ncrabbox: the smolvm API truncated stdout at 1 MiB and sent no complete copy\n"},
+		{"truncated text without exact copy is marked", map[string]any{"stdout": full[:8], "stdoutTruncated": true}, full[:8] + "\ncrabbox: the smolvm API truncated stdout and sent no complete copy; rerun with reduced verbosity or save output to a guest file\n"},
 		{"text only response is kept", map[string]any{"stdout": "hello\n"}, "hello\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -682,7 +682,7 @@ func TestExecPrefersExactOutputOverTruncatedText(t *testing.T) {
 				t.Fatal(err)
 			}
 			if out.String() != tc.wantStdout {
-				t.Fatalf("stream output=%q, want %q", out.String(), tc.wantStdout)
+				t.Fatalf("stream output has %d bytes, want %d; prefix=%.80q", out.Len(), len(tc.wantStdout), out.String())
 			}
 		})
 	}
@@ -1651,16 +1651,23 @@ func TestClientNativeUploadFailureAndPublication(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				// The files route writes the raw body root-owned style (0644) into an existing directory.
 				if guestPath, ok := strings.CutPrefix(r.URL.Path, "/v1/machines/fixture/files"); ok && r.Method == http.MethodPut {
-					if strings.HasPrefix(tc.failure, "reject") {
-						http.Error(w, "file exceeds the upload limit", http.StatusRequestEntityTooLarge)
-						return
-					}
 					data, err := io.ReadAll(r.Body)
+					if info, statErr := os.Stat(filepath.Dir(guestPath)); statErr != nil || info.Mode().Perm() != 0o700 {
+						t.Errorf("upload staging directory is not private: info=%v err=%v", info, statErr)
+					}
+					if strings.HasPrefix(tc.failure, "reject") {
+						// Rejections can leave a partial file that still needs cleanup.
+						data = data[:min(len(data), 7)]
+					}
 					if err == nil {
 						err = os.WriteFile(guestPath, data, 0o644)
 					}
 					if err != nil {
 						http.Error(w, err.Error(), 500)
+						return
+					}
+					if strings.HasPrefix(tc.failure, "reject") {
+						http.Error(w, "file exceeds the upload limit", http.StatusRequestEntityTooLarge)
 						return
 					}
 					w.WriteHeader(http.StatusNoContent)
@@ -1681,7 +1688,7 @@ func TestClientNativeUploadFailureAndPublication(t *testing.T) {
 				script := strings.ReplaceAll(request.Command, "/tmp/crabbox-sync.tgz", core.ShellQuote(filepath.Join(root, "baseline-sync.tgz")))
 				script = strings.ReplaceAll(script, "/tmp/crabbox-write-", filepath.Join(root, "baseline-write-"))
 				cmd := exec.Command("sh", "-c", "umask 022\n"+scriptPrefix+script)
-				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + root, "TMPDIR=" + root}
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + root, "TMPDIR=" + root + "/./"}
 				out, err := cmd.CombinedOutput()
 				code := 0
 				if err != nil {

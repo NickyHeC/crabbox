@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	core "github.com/openclaw/crabbox/internal/cli"
 	"github.com/openclaw/crabbox/internal/providers/shared"
@@ -303,11 +304,11 @@ func (c *client) Exec(ctx context.Context, machineID, command, folder string) (e
 
 // exactOutput prefers the byte-exact copy and marks capped text it cannot replace.
 func exactOutput(text string, exact []byte, truncated bool, stream string) string {
-	if len(exact) > 0 {
+	if exact != nil {
 		return string(exact)
 	}
 	if truncated {
-		return text + "\ncrabbox: the smolvm API truncated " + stream + " at 1 MiB and sent no complete copy\n"
+		return text + "\ncrabbox: the smolvm API truncated " + stream + " and sent no complete copy; rerun with reduced verbosity or save output to a guest file\n"
 	}
 	return text
 }
@@ -368,7 +369,9 @@ func (c *client) WriteFile(ctx context.Context, machineID, remotePath, content s
 // creates it, the files route fills it, and a second exec consumes and removes
 // it. Cleanup is not guaranteed after SIGKILL or ambiguous remote HTTP completion.
 func (c *client) withUploadedFile(ctx context.Context, machineID string, data io.Reader, size int64, prepare, stagingParent, consume, operation string) error {
-	stage := "set -eu\numask 077\n" + prepare + "mktemp -d " + stagingParent + "/.crabbox-upload.XXXXXXXXXX\n"
+	stage := "set -eu\numask 077\n" + prepare +
+		"upload_parent=$(cd " + stagingParent + " && pwd -P)\n" +
+		"mktemp -d \"${upload_parent%/}/.crabbox-upload.XXXXXXXXXX\"\n"
 	res, err := c.Exec(ctx, machineID, stage, "")
 	if err != nil {
 		return fmt.Errorf("smolvm direct %s staging: %w", operation, err)
@@ -376,9 +379,9 @@ func (c *client) withUploadedFile(ctx context.Context, machineID string, data io
 	if res.ExitCode != 0 {
 		return commandExitError("smolvm direct "+operation, res)
 	}
-	uploadDir := strings.TrimSpace(res.Output)
-	if !strings.HasPrefix(uploadDir, "/") || strings.Contains(uploadDir, "\n") {
-		return fmt.Errorf("smolvm direct %s staging returned %q, want one absolute directory", operation, uploadDir)
+	uploadDir := strings.TrimSuffix(res.Output, "\n")
+	if !validUploadDir(uploadDir) {
+		return fmt.Errorf("smolvm direct %s staging returned an invalid private upload directory", operation)
 	}
 	// The payload goes over the files route because /exec takes a JSON body
 	// capped at 1 MiB; the files route takes the raw bytes up to 100 MiB.
@@ -400,6 +403,23 @@ func (c *client) withUploadedFile(ctx context.Context, machineID string, data io
 		return commandExitError("smolvm direct "+operation, res)
 	}
 	return nil
+}
+
+func validUploadDir(dir string) bool {
+	// Never turn malformed remote output into an upload target or rm -rf path.
+	if !path.IsAbs(dir) || path.Clean(dir) != dir || strings.IndexFunc(dir, unicode.IsControl) >= 0 {
+		return false
+	}
+	suffix, ok := strings.CutPrefix(path.Base(dir), ".crabbox-upload.")
+	if !ok || len(suffix) != 10 {
+		return false
+	}
+	for _, char := range suffix {
+		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *client) putFile(ctx context.Context, machineID, guestPath string, data io.Reader, size int64) error {

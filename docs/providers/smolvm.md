@@ -17,6 +17,12 @@ SmolVM is Linux-only. Desktop, browser, code, and SSH-based run options are not 
 
 Create a smol machines API key at https://smolmachines.com/console/keys. Keys are prefixed `smk_...`. Workspace sync and environment forwarding upload through the files route, so a key with narrowed scopes needs `machine:files` as well as `machine:exec`.
 
+When upgrading from exec-based uploads, replace a narrowed key that lacks
+`machine:files` with one granting that scope as well as its existing lifecycle
+scopes. A `403` naming `machine:files` means the key must be updated; retrying
+with the same key will not fix it. See the [official scope reference](https://smolmachines.com/auth.md)
+and [upload API schema](https://smolmachines.com/openapi.json).
+
 Export the key through the environment using one of the accepted variable names. Crabbox never accepts the key as a command-line flag.
 
 ## Auth
@@ -193,7 +199,7 @@ The [hosted API](https://smolmachines.com/docs/cloud/api-reference) uses 404 bot
 - Network is open by default.
 - Archive sync and small file writes send their bytes through the files route, not inside the `/exec` command. The hosted API caps JSON request bodies, `/exec` included, at 1 MiB and a files-route upload at 100 MiB.
 - Archive and small-file uploads share a checked byte-transfer path: an invocation-private directory holds the complete uploaded file before extraction or publication. Upload, write, extraction and temporary-cleanup failures return nonzero status; an earlier failure remains primary. Small files are published from a private same-filesystem staging copy, so a failed upload does not truncate an existing destination. Archive extraction retains the incoming file-mode mask.
-- The hosted API caps each output stream's text at 1 MiB and also returns a complete base64 copy; Crabbox prints the complete copy, and marks the output when a response reports truncation without one.
+- The hosted API caps each output stream's text at 1 MiB and also returns a complete base64 copy; Crabbox prints the complete copy, and marks the output when a response reports truncation without one. In that case, rerun with reduced verbosity or save output to a guest file.
 - Remote traps clean temporary upload files on ordinary completion and handled signals. They do not guarantee cleanup after SIGKILL or an ambiguous HTTP failure while the remote command may still run. This does not make workspace replacement transactional. Final environment profiles use the separate run-scoped owner described below.
 - No direct `crabbox ssh` / `crabbox vnc` (delegated execution model).
 - Supports `warmup`, `run`, `status`, `stop`, `list`, and `doctor`.
