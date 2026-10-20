@@ -78,6 +78,12 @@ type execResult struct {
 	// stdout/stderr fallbacks for variants that use output/error keys.
 	Output string `json:"output"`
 	Error  string `json:"error"`
+	// The hosted API caps stdout/stderr at 1 MiB and flags the cut; the
+	// base64 copies carry every byte.
+	StdoutB64       []byte `json:"stdoutB64"`
+	StderrB64       []byte `json:"stderrB64"`
+	StdoutTruncated bool   `json:"stdoutTruncated"`
+	StderrTruncated bool   `json:"stderrTruncated"`
 }
 
 // smolvmAPIError is the structured error returned for non-2xx responses from
@@ -284,6 +290,8 @@ func (c *client) Exec(ctx context.Context, machineID, command, folder string) (e
 	if result.ExitCode == 0 && result.ExitCodeSnake != 0 {
 		result.ExitCode = result.ExitCodeSnake
 	}
+	result.Stdout = exactOutput(result.Stdout, result.StdoutB64, result.StdoutTruncated, "stdout")
+	result.Stderr = exactOutput(result.Stderr, result.StderrB64, result.StderrTruncated, "stderr")
 	if result.Output == "" {
 		result.Output = result.Stdout
 	}
@@ -291,6 +299,17 @@ func (c *client) Exec(ctx context.Context, machineID, command, folder string) (e
 		result.Error = result.Stderr
 	}
 	return result, nil
+}
+
+// exactOutput prefers the byte-exact copy and marks capped text it cannot replace.
+func exactOutput(text string, exact []byte, truncated bool, stream string) string {
+	if len(exact) > 0 {
+		return string(exact)
+	}
+	if truncated {
+		return text + "\ncrabbox: the smolvm API truncated " + stream + " at 1 MiB and sent no complete copy\n"
+	}
+	return text
 }
 
 func (c *client) ExecStream(ctx context.Context, machineID, command, folder string, stdout io.Writer) (int, error) {

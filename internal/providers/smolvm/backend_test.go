@@ -660,6 +660,34 @@ func TestExecExitCodePropagatesCamelAndSnake(t *testing.T) {
 	}
 }
 
+func TestExecPrefersExactOutputOverTruncatedText(t *testing.T) {
+	full := strings.Repeat("x", 64) + "\xff end"
+	for _, tc := range []struct {
+		name       string
+		resp       map[string]any
+		wantStdout string
+	}{
+		{"truncated text replaced by exact copy", map[string]any{"stdout": full[:8], "stdoutTruncated": true, "stdoutB64": base64.StdEncoding.EncodeToString([]byte(full))}, full},
+		{"truncated text without exact copy is marked", map[string]any{"stdout": full[:8], "stdoutTruncated": true}, full[:8] + "\ncrabbox: the smolvm API truncated stdout at 1 MiB and sent no complete copy\n"},
+		{"text only response is kept", map[string]any{"stdout": "hello\n"}, "hello\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(tc.resp)
+			}))
+			defer srv.Close()
+			c := &client{apiKey: "smk_key", base: srv.URL, http: srv.Client()}
+			var out bytes.Buffer
+			if _, err := c.ExecStream(t.Context(), "mach_1", "make test", "/workspace", &out); err != nil {
+				t.Fatal(err)
+			}
+			if out.String() != tc.wantStdout {
+				t.Fatalf("stream output=%q, want %q", out.String(), tc.wantStdout)
+			}
+		})
+	}
+}
+
 func TestCleanWorkdirAndCommand(t *testing.T) {
 	if got, err := cleanWorkdir(" /workspace "); err != nil || got != "/workspace" {
 		t.Fatalf("workdir=%q err=%v", got, err)
