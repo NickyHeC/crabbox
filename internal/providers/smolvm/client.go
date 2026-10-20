@@ -313,7 +313,8 @@ func exactOutput(text string, exact []byte, truncated bool, stream string) strin
 }
 
 func (c *client) ExecStream(ctx context.Context, machineID, command, folder string, stdout io.Writer) (int, error) {
-	// No native stream on this API; fall back to Exec and dump output at end.
+	// The hosted API can stream exec output as Server-Sent Events; this
+	// provider still collects it with Exec and writes it at the end.
 	result, err := c.Exec(ctx, machineID, command, folder)
 	if err != nil {
 		return 0, err
