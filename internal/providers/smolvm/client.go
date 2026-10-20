@@ -3,7 +3,6 @@ package smolvm
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +40,8 @@ type client struct {
 }
 
 const smolvmControlTimeout = 60 * time.Second
+
+const uploadCleanupTimeout = 30 * time.Second
 
 type createRequest struct {
 	Name       string                 `json:"name,omitempty"`
@@ -312,7 +313,12 @@ func (c *client) ExecStream(ctx context.Context, machineID, command, folder stri
 }
 
 func (c *client) InjectArchive(ctx context.Context, machineID, localPath, targetDir string) error {
-	data, err := os.ReadFile(localPath)
+	archive, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer archive.Close()
+	info, err := archive.Stat()
 	if err != nil {
 		return err
 	}
@@ -320,7 +326,7 @@ func (c *client) InjectArchive(ctx context.Context, machineID, localPath, target
 	if !strings.HasPrefix(absTarget, "/") {
 		absTarget = "/workspace"
 	}
-	return c.withDecodedFile(ctx, machineID, data, "", `"${TMPDIR:-/tmp}"`,
+	return c.withUploadedFile(ctx, machineID, archive, info.Size(), "", `"${TMPDIR:-/tmp}"`,
 		"tar -xzf \"$upload_dir/payload\" -C "+core.ShellQuote(absTarget), "archive extract")
 }
 
@@ -332,30 +338,70 @@ func (c *client) WriteFile(ctx context.Context, machineID, remotePath, content s
 	parent := core.ShellQuote(path.Dir(absPath))
 	// Stage beside the destination so publication stays on one filesystem.
 	prepare := "mkdir -p " + parent + "\n[ ! -d " + core.ShellQuote(absPath) + " ] || { echo 'file destination is a directory' >&2; exit 1; }\n"
-	return c.withDecodedFile(ctx, machineID, []byte(content), prepare, parent,
-		"mv -f \"$upload_dir/payload\" "+core.ShellQuote(absPath), "write")
+	// The copy makes the published file private and owned by the exec user,
+	// whichever owner and mode the files route gave the upload.
+	consume := "umask 077\ncat \"$upload_dir/payload\" > \"$upload_dir/file\"\nmv -f \"$upload_dir/file\" " + core.ShellQuote(absPath)
+	return c.withUploadedFile(ctx, machineID, strings.NewReader(content), int64(len(content)), prepare, parent, consume, "write")
 }
 
-// withDecodedFile owns only this exec's private staging directory. Its trap
-// cannot guarantee cleanup after SIGKILL or ambiguous remote HTTP completion.
-func (c *client) withDecodedFile(ctx context.Context, machineID string, data []byte, prepare, stagingParent, consume, operation string) error {
-	// Check decoding separately from consumption: POSIX pipelines only expose
-	// the last command's status, even when the decoder emitted partial data.
-	const eof = "CRABBOX_UPLOAD_B64_EOF"
-	script := "set -eu\nupload_umask=$(umask)\numask 077\n" + prepare +
-		"upload_dir=$(mktemp -d " + stagingParent + "/.crabbox-upload.XXXXXXXXXX)\n" +
-		`trap 'upload_status=$?; trap - 0; rm -rf -- "$upload_dir" || { echo "upload staging cleanup failed" >&2; [ "$upload_status" -ne 0 ] || upload_status=1; }; exit "$upload_status"' 0` + "\n" +
-		"trap 'exit 129' HUP\ntrap 'exit 130' INT\ntrap 'exit 143' TERM\n" +
-		"base64 -d > \"$upload_dir/payload\" << '" + eof + "'\n" +
-		base64.StdEncoding.EncodeToString(data) + "\n" + eof + "\n" +
-		"umask \"$upload_umask\"\n" +
-		consume + "\n"
-	res, err := c.Exec(ctx, machineID, script, "")
+// withUploadedFile owns only this upload's private staging directory: one exec
+// creates it, the files route fills it, and a second exec consumes and removes
+// it. Cleanup is not guaranteed after SIGKILL or ambiguous remote HTTP completion.
+func (c *client) withUploadedFile(ctx context.Context, machineID string, data io.Reader, size int64, prepare, stagingParent, consume, operation string) error {
+	stage := "set -eu\numask 077\n" + prepare + "mktemp -d " + stagingParent + "/.crabbox-upload.XXXXXXXXXX\n"
+	res, err := c.Exec(ctx, machineID, stage, "")
 	if err != nil {
-		return fmt.Errorf("smolvm direct %s exec: %w", operation, err)
+		return fmt.Errorf("smolvm direct %s staging: %w", operation, err)
 	}
 	if res.ExitCode != 0 {
 		return commandExitError("smolvm direct "+operation, res)
+	}
+	uploadDir := strings.TrimSpace(res.Output)
+	if !strings.HasPrefix(uploadDir, "/") || strings.Contains(uploadDir, "\n") {
+		return fmt.Errorf("smolvm direct %s staging returned %q, want one absolute directory", operation, uploadDir)
+	}
+	// The payload goes over the files route because /exec takes a JSON body
+	// capped at 1 MiB; the files route takes the raw bytes up to 100 MiB.
+	err = c.putFile(ctx, machineID, uploadDir+"/payload", data, size)
+	if err == nil {
+		res, err = c.Exec(ctx, machineID, "set -eu\nupload_dir="+core.ShellQuote(uploadDir)+"\n"+
+			`trap 'upload_status=$?; trap - 0; rm -rf -- "$upload_dir" || { echo "upload staging cleanup failed" >&2; [ "$upload_status" -ne 0 ] || upload_status=1; }; exit "$upload_status"' 0`+"\n"+
+			"trap 'exit 129' HUP\ntrap 'exit 130' INT\ntrap 'exit 143' TERM\n"+consume+"\n", "")
+	}
+	if err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), uploadCleanupTimeout)
+		defer cancel()
+		if cleanup, cleanupErr := c.Exec(cleanupCtx, machineID, "rm -rf -- "+core.ShellQuote(uploadDir), ""); cleanupErr != nil || cleanup.ExitCode != 0 {
+			return fmt.Errorf("smolvm direct %s: %w (upload staging cleanup failed)", operation, err)
+		}
+		return fmt.Errorf("smolvm direct %s: %w", operation, err)
+	}
+	if res.ExitCode != 0 {
+		return commandExitError("smolvm direct "+operation, res)
+	}
+	return nil
+}
+
+func (c *client) putFile(ctx context.Context, machineID, guestPath string, data io.Reader, size int64) error {
+	u := c.base + "/v1/machines/" + url.PathEscape(machineID) + "/files" + (&url.URL{Path: guestPath}).EscapedPath()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, data)
+	if err != nil {
+		return err
+	}
+	req.ContentLength = size
+	c.addHeaders(req)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	httpClient := c.dataHTTP
+	if httpClient == nil {
+		httpClient = c.http
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return apiError(resp, c.apiKey)
 	}
 	return nil
 }
